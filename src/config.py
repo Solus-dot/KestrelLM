@@ -1,68 +1,69 @@
 from pathlib import Path
 
 
-# Absolute path to the root of the KestrelLM repository.
+# Project root and file-system paths.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# Directory and file used to store the trained tokenizer.
 TOKENIZER_DIR = PROJECT_ROOT / "tokenizer"
 TOKENIZER_PATH = TOKENIZER_DIR / "tokenizer.json"
 
-# Directory used for datasets and other local training data.
 DATA_DIR = PROJECT_ROOT / "data"
-
-# Local copy of the processed TinyStories dataset.
 TINYSTORIES_DIR = DATA_DIR / "tinystories"
-
-# Temporary Hugging Face cache used only while downloading the dataset.
 HF_CACHE_DIR = DATA_DIR / "hf_cache"
-
-# Directory containing tokenized datasets ready for model training.
 TOKENIZED_DATA_DIR = DATA_DIR / "tokenized"
 
-# Compact binary token streams for the training and validation splits.
 TRAIN_TOKENS_PATH = TOKENIZED_DATA_DIR / "train.bin"
 VALIDATION_TOKENS_PATH = TOKENIZED_DATA_DIR / "validation.bin"
 
-# Number of independent token sequences processed in one training batch.
-BATCH_SIZE = 16
+CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
+LATEST_CHECKPOINT = CHECKPOINT_DIR / "latest.pt"
 
-# Number of unique tokens in the tokenizer vocabulary.
+
+# Tokenizer configuration.
 VOCAB_SIZE = 8192
 
-# Special tokens used by the tokenizer and training pipeline.
 PAD_TOKEN = "<pad>"
 UNK_TOKEN = "<unk>"
 BOS_TOKEN = "<bos>"
 EOS_TOKEN = "<eos>"
 
-SPECIAL_TOKENS = [
-    PAD_TOKEN,
-    UNK_TOKEN,
-    BOS_TOKEN,
-    EOS_TOKEN,
-]
+SPECIAL_TOKENS = [PAD_TOKEN, UNK_TOKEN, BOS_TOKEN, EOS_TOKEN]
 
-# Maximum number of tokens the model can process in one sequence.
+
+# Transformer architecture.
 CONTEXT_LENGTH = 512
-
-# Hidden dimension of every token representation.
 D_MODEL = 512
-
-# Number of transformer blocks.
 N_LAYERS = 6
-
-# Number of attention heads in each transformer block.
 N_HEADS = 8
-
-# Hidden dimension handled by each attention head.
 D_HEAD = D_MODEL // N_HEADS
-
-# Intermediate dimension of the feed-forward network.
 D_FF = 2048
 
-# Multi-head attention requires the hidden dimension to split evenly
-# across all attention heads.
-assert D_MODEL % N_HEADS == 0, (
-    "D_MODEL must be evenly divisible by N_HEADS."
-)
+assert D_MODEL % N_HEADS == 0
+
+
+# Training configuration.
+BATCH_SIZE = 2
+GRADIENT_ACCUMULATION_STEPS = 16
+
+LEARNING_RATE = 1e-4
+MIN_LEARNING_RATE = 1e-5
+WARMUP_STEPS = 500
+
+ADAM_BETA_1 = 0.9
+ADAM_BETA_2 = 0.95
+WEIGHT_DECAY = 0.1
+
+MAX_GRAD_NORM = 1.0
+
+# TRAINING_STEPS defines the complete pretraining schedule.
+# RUN_UNTIL_STEP lets an individual invocation stop earlier for testing.
+TRAINING_STEPS = 36_622
+RUN_UNTIL_STEP = 1_000
+
+VALIDATION_INTERVAL = 100
+VALIDATION_BATCHES = 20
+
+CHECKPOINT_INTERVAL = 250
+MILESTONE_CHECKPOINT_INTERVAL = 1_000
+
+RESUME_CHECKPOINT = None
