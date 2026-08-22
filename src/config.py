@@ -17,6 +17,16 @@ TINYSTORIES_DIR = DATA_DIR / "tinystories"
 # Temporary Hugging Face cache used only while downloading the dataset.
 HF_CACHE_DIR = DATA_DIR / "hf_cache"
 
+# Directory containing tokenized datasets ready for model training.
+TOKENIZED_DATA_DIR = DATA_DIR / "tokenized"
+
+# Compact binary token streams for the training and validation splits.
+TRAIN_TOKENS_PATH = TOKENIZED_DATA_DIR / "train.bin"
+VALIDATION_TOKENS_PATH = TOKENIZED_DATA_DIR / "validation.bin"
+
+# Number of independent token sequences processed in one training batch.
+BATCH_SIZE = 16
+
 # Number of unique tokens in the tokenizer vocabulary.
 VOCAB_SIZE = 8192
 

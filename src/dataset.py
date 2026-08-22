@@ -1,114 +1,127 @@
-from datasets import load_dataset
-from tokenizers import Tokenizer
+import numpy as np
+import torch
+from torch.utils.data import Dataset
 
 from config import (
-    EOS_TOKEN,
-    TOKENIZER_PATH,
-    CONTEXT_LENGTH
+    CONTEXT_LENGTH,
+    TRAIN_TOKENS_PATH,
+    VALIDATION_TOKENS_PATH,
 )
 
-DATASET_NAME = "roneneldan/TinyStories"
-DATASET_SPLIT = "train"
 
-# Loads the trained KestrelLM tokenizer.
-def load_tokenizer():
-    return Tokenizer.from_file(
-        str(TOKENIZER_PATH)
-    )
+# Provides fixed-length language-model training examples from a binary token file.
+# The underlying file is memory-mapped instead of being loaded completely into RAM.
+# Each sample returns X and Y, where Y is X shifted forward by exactly one token.
+class BinaryTokenDataset(Dataset):
+    def __init__(self, token_file, context_length=CONTEXT_LENGTH):
+        self.token_file = token_file
+        self.context_length = context_length
 
-# Loads the TinyStories training split
-from datasets import load_from_disk
-from config import TINYSTORIES_DIR
-
-# Loads our local TinyStories dataset
-def load_training_dataset():
-    dataset = load_from_disk(
-        str(TINYSTORIES_DIR)
-    )
-
-    return dataset["train"]
-
-# Converts one story into token IDs
-# Appends <eos> so document boundaries are visible to the model
-def encode_story(tokenizer, text):
-    token_ids = tokenizer.encode(text).ids
-
-    eos_id = tokenizer.token_to_id(EOS_TOKEN)
-    token_ids.append(eos_id)
-
-    return token_ids
-
-# Encodes several stories and concatenates them into one token stream
-# The <eos> token remains between stories as a document separator
-def build_token_stream(tokenizer, dataset, num_stories):
-    token_stream = []
-
-    for i in range(num_stories):
-        story = dataset[i]["text"]
-
-        story_tokens = encode_story(
-            tokenizer,
-            story,
+        # The preprocessing step stored every token as an unsigned 16-bit integer.
+        self.tokens = np.memmap(
+            token_file,
+            dtype=np.uint16,
+            mode="r",
         )
 
-        token_stream.extend(story_tokens)
+        # Each training example needs T + 1 tokens:
+        # T tokens for X and the following T tokens for Y.
+        #
+        # Samples are spaced T tokens apart so we avoid creating billions
+        # of almost-identical overlapping training examples.
+        self.num_samples = (
+            len(self.tokens) - 1
+        ) // self.context_length
 
-    return token_stream
+    # Returns the number of complete training examples available.
+    def __len__(self):
+        return self.num_samples
 
-# Takes CONTEXT_LENGTH + 1 consecutive tokens from the token stream
-# Returns an input sequence X and its one-token-shifted target sequence Y
-def create_training_pair(token_stream, start_index):
-    chunk = token_stream[
-        start_index : start_index + CONTEXT_LENGTH + 1
-    ]
+    # Retrieves one contiguous T + 1 token chunk.
+    # X contains the first T tokens and Y contains the same sequence shifted by one.
+    def __getitem__(self, index):
+        if index < 0 or index >= self.num_samples:
+            raise IndexError("Dataset index out of range.")
 
-    if len(chunk) != CONTEXT_LENGTH + 1:
-        raise ValueError(
-            "Not enough tokens remaining to create a full training pair."
+        start = index * self.context_length
+        end = start + self.context_length + 1
+
+        chunk = self.tokens[start:end]
+
+        # Embedding layers expect token indices to use torch.long (int64).
+        # torch.tensor also copies the data out of the read-only memory map.
+        x = torch.tensor(
+            chunk[:-1],
+            dtype=torch.long,
         )
 
-    x = chunk[:-1]
-    y = chunk[1:]
+        y = torch.tensor(
+            chunk[1:],
+            dtype=torch.long,
+        )
 
-    return x, y
+        return x, y
 
-# Builds a small token stream and verifies that input and target
-# sequences are exactly one token apart.
+
+# Loads the preprocessed training token stream.
+def create_train_dataset():
+    return BinaryTokenDataset(
+        TRAIN_TOKENS_PATH
+    )
+
+
+# Loads the preprocessed validation token stream.
+def create_validation_dataset():
+    return BinaryTokenDataset(
+        VALIDATION_TOKENS_PATH
+    )
+
+
+# Performs basic checks on one training example.
+# This verifies shapes, data types, and the one-token target shift.
 def main():
-    tokenizer = load_tokenizer()
-    dataset = load_training_dataset()
+    train_dataset = create_train_dataset()
+    validation_dataset = create_validation_dataset()
 
-    token_stream = build_token_stream(
-        tokenizer,
-        dataset,
-        num_stories=10,
-    )
+    print("Training samples:")
+    print(f"{len(train_dataset):,}")
 
-    x, y = create_training_pair(
-        token_stream,
-        start_index=0,
-    )
+    print("\nValidation samples:")
+    print(f"{len(validation_dataset):,}")
 
-    print("Input length:")
-    print(len(x))
+    x, y = train_dataset[0]
 
-    print("\nTarget length:")
-    print(len(y))
+    print("\nX shape:")
+    print(x.shape)
 
-    print("\nFirst 10 input IDs:")
+    print("\nY shape:")
+    print(y.shape)
+
+    print("\nX dtype:")
+    print(x.dtype)
+
+    print("\nY dtype:")
+    print(y.dtype)
+
+    print("\nFirst 10 X tokens:")
     print(x[:10])
 
-    print("\nFirst 10 target IDs:")
+    print("\nFirst 10 Y tokens:")
     print(y[:10])
 
-    assert len(x) == CONTEXT_LENGTH
-    assert len(y) == CONTEXT_LENGTH
+    assert x.shape == (CONTEXT_LENGTH,)
+    assert y.shape == (CONTEXT_LENGTH,)
 
-    # Every target token should be the token immediately after
-    # the corresponding input token in the original stream.
-    assert x[1:] == y[:-1]
+    assert x.dtype == torch.long
+    assert y.dtype == torch.long
 
-    print("\nTraining pair test: PASSED")
+    assert torch.equal(
+        x[1:],
+        y[:-1],
+    )
+
+    print("\nDataset test: PASSED")
+
 
 if __name__ == "__main__":
     main()

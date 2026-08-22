@@ -647,6 +647,7 @@ dependencies = [
     { name = "numpy" },
     { name = "tokenizers" },
     { name = "torch" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -655,6 +656,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.5.2" },
     { name = "tokenizers", specifier = ">=0.23.1" },
     { name = "torch", specifier = ">=2.13.0" },
+    { name = "tqdm", specifier = ">=4.70.0" },
 ]
 
 [[package]]
