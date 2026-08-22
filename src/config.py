@@ -8,6 +8,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TOKENIZER_DIR = PROJECT_ROOT / "tokenizer"
 TOKENIZER_PATH = TOKENIZER_DIR / "tokenizer.json"
 
+# Directory used for datasets and other local training data.
+DATA_DIR = PROJECT_ROOT / "data"
+
+# Local copy of the processed TinyStories dataset.
+TINYSTORIES_DIR = DATA_DIR / "tinystories"
+
+# Temporary Hugging Face cache used only while downloading the dataset.
+HF_CACHE_DIR = DATA_DIR / "hf_cache"
+
 # Number of unique tokens in the tokenizer vocabulary.
 VOCAB_SIZE = 8192
 
