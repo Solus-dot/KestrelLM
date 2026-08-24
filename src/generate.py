@@ -31,6 +31,9 @@ def print_device_info(device):
         print(f"GPU backend: {backend}")
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
+        if torch.version.hip is not None:
+            print(f"HIP version: {torch.version.hip}")
+
     elif device.type == "mps":
         print("GPU backend: Apple MPS")
 
@@ -47,7 +50,7 @@ def load_tokenizer():
 
 
 # Loads the final pretrained KestrelLM checkpoint for inference.
-# Optimizer state is ignored because generation performs no training updates.
+# Optimizer state is unnecessary because generation performs no updates.
 def load_model(device):
     if not FINAL_CHECKPOINT.exists():
         raise FileNotFoundError(f"Checkpoint not found: {FINAL_CHECKPOINT}")
@@ -81,35 +84,25 @@ def sample_top_p(probabilities, top_p):
     if top_p >= 1.0:
         return torch.multinomial(probabilities, num_samples=1)
 
-    sorted_probabilities, sorted_indices = torch.sort(
-        probabilities,
-        descending=True,
-    )
-
-    cumulative_probabilities = torch.cumsum(
-        sorted_probabilities,
-        dim=-1,
-    )
+    sorted_probabilities, sorted_indices = torch.sort(probabilities, descending=True)
+    cumulative_probabilities = torch.cumsum(sorted_probabilities, dim=-1)
 
     remove_mask = cumulative_probabilities > top_p
 
-    # Shift the mask so the first token crossing the threshold is retained.
+    # Keeps the first token that crosses the top-p threshold.
     remove_mask[1:] = remove_mask[:-1].clone()
     remove_mask[0] = False
 
     sorted_probabilities[remove_mask] = 0.0
     sorted_probabilities /= sorted_probabilities.sum()
 
-    sampled_position = torch.multinomial(
-        sorted_probabilities,
-        num_samples=1,
-    )
+    sampled_position = torch.multinomial(sorted_probabilities, num_samples=1)
 
     return sorted_indices[sampled_position]
 
 
 # Converts the model's next-token logits into one sampled token.
-# Temperature 0 performs greedy decoding instead of random sampling.
+# Temperature 0 performs deterministic greedy decoding.
 def sample_next_token(logits, temperature, top_k, top_p):
     if temperature == 0:
         return torch.argmax(logits, dim=-1, keepdim=True)
@@ -122,8 +115,27 @@ def sample_next_token(logits, temperature, top_k, top_p):
     return sample_top_p(probabilities, top_p)
 
 
-# Generates tokens autoregressively from a text prompt.
-# Only the most recent CONTEXT_LENGTH tokens are passed to the model.
+# Processes the current visible context and creates a fresh KV cache.
+# This is used once for the initial prompt and again only if the context fills up.
+def prefill_context(model, token_ids, device):
+    context_ids = token_ids[-CONTEXT_LENGTH:]
+
+    input_ids = torch.tensor(
+        [context_ids],
+        dtype=torch.long,
+        device=device,
+    )
+
+    logits, kv_cache = model(
+        input_ids,
+        use_cache=True,
+    )
+
+    return logits, kv_cache
+
+
+# Generates text autoregressively while reusing each layer's cached keys and values.
+# Once the 512-token context fills, the cache is rebuilt from the newest 512 tokens.
 def generate(
     model,
     tokenizer,
@@ -146,19 +158,17 @@ def generate(
 
     eos_token_id = tokenizer.token_to_id(EOS_TOKEN)
 
+    if eos_token_id is None:
+        raise ValueError(f"EOS token not found in tokenizer: {EOS_TOKEN}")
+
     with torch.inference_mode():
+        logits, kv_cache = prefill_context(
+            model,
+            generated_ids,
+            device,
+        )
+
         for _ in range(max_new_tokens):
-            context_ids = generated_ids[-CONTEXT_LENGTH:]
-
-            input_ids = torch.tensor(
-                [context_ids],
-                dtype=torch.long,
-                device=device,
-            )
-
-            logits = model(input_ids)
-
-            # Only the final position predicts the next token.
             next_token_logits = logits[0, -1]
 
             next_token = sample_next_token(
@@ -173,6 +183,30 @@ def generate(
 
             if next_token_id == eos_token_id:
                 break
+
+            cache_length = model.get_cache_length(kv_cache)
+
+            if cache_length < CONTEXT_LENGTH:
+                input_ids = torch.tensor(
+                    [[next_token_id]],
+                    dtype=torch.long,
+                    device=device,
+                )
+
+                logits, kv_cache = model(
+                    input_ids,
+                    kv_cache=kv_cache,
+                    use_cache=True,
+                )
+
+            else:
+                # The learned positional embeddings only cover positions 0-511.
+                # Rebuild the cache from the newest context window once it is full.
+                logits, kv_cache = prefill_context(
+                    model,
+                    generated_ids,
+                    device,
+                )
 
     return tokenizer.decode(
         generated_ids,
@@ -257,6 +291,7 @@ def main():
 
     print_device_info(device)
     print(f"Checkpoint: {FINAL_CHECKPOINT}")
+    print("KV cache: enabled")
     print(f"Temperature: {args.temperature}")
     print(f"Top-k: {args.top_k}")
     print(f"Top-p: {args.top_p}")

@@ -16,7 +16,7 @@ PREFILL_MEASURED_RUNS = 20
 GENERATION_PROMPT_LENGTH = 32
 GENERATION_TOKENS = 200
 GENERATION_WARMUP_TOKENS = 20
-GENERATION_MEASURED_RUNS = 3
+GENERATION_MEASURED_RUNS = 5
 
 BENCHMARK_TEXT = (
     "Once upon a time, there was a little girl who loved to explore the forest. "
@@ -37,7 +37,7 @@ def get_device():
 
 
 # Waits until all queued accelerator operations have completed.
-# Accurate GPU timings require synchronization before reading the clock.
+# GPU work is asynchronous, so synchronization is required for accurate timing.
 def synchronize(device):
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -93,8 +93,7 @@ def load_model(device):
     return model
 
 
-# Produces a repeatable stream of real tokenizer IDs long enough for all tests.
-# Using tokenizer output keeps benchmark inputs representative of normal inference.
+# Produces enough real tokenizer IDs for every benchmark context length.
 def create_benchmark_tokens(tokenizer):
     repeated_text = BENCHMARK_TEXT
 
@@ -110,8 +109,8 @@ def create_benchmark_tokens(tokenizer):
         repeated_text += BENCHMARK_TEXT
 
 
-# Measures one forward pass over an existing prompt.
-# This is the prompt-processing or prefill phase of autoregressive inference.
+# Measures one ordinary forward pass over an existing prompt.
+# This represents the prefill or prompt-processing phase of inference.
 def benchmark_prefill(model, token_ids, device):
     input_ids = torch.tensor(
         [token_ids],
@@ -140,8 +139,8 @@ def benchmark_prefill(model, token_ids, device):
     return seconds_per_run, tokens_per_second
 
 
-# Generates tokens using the current naive inference implementation.
-# Every new token causes the entire visible context to be recomputed.
+# Generates text using the original inference method.
+# Every generated token recomputes the entire visible context from scratch.
 def generate_naive(model, prompt_ids, device, new_tokens):
     generated_ids = list(prompt_ids)
 
@@ -163,10 +162,93 @@ def generate_naive(model, prompt_ids, device, new_tokens):
     return generated_ids
 
 
-# Measures autoregressive decoding throughput without a KV cache.
-# EOS is intentionally ignored so every run generates exactly the same token count.
-def benchmark_generation(model, prompt_ids, device):
-    generate_naive(
+# Generates text using the KV cache.
+# The prompt is processed once and later steps process only the newest token.
+def generate_cached(model, prompt_ids, device, new_tokens):
+    if len(prompt_ids) + new_tokens > CONTEXT_LENGTH:
+        raise ValueError(
+            "Cached benchmark sequence exceeds the model context length."
+        )
+
+    generated_ids = list(prompt_ids)
+
+    input_ids = torch.tensor(
+        [prompt_ids],
+        dtype=torch.long,
+        device=device,
+    )
+
+    with torch.inference_mode():
+        logits, kv_cache = model(
+            input_ids,
+            use_cache=True,
+        )
+
+        next_token_id = torch.argmax(
+            logits[0, -1]
+        ).item()
+
+        generated_ids.append(next_token_id)
+
+        for _ in range(new_tokens - 1):
+            input_ids = torch.tensor(
+                [[next_token_id]],
+                dtype=torch.long,
+                device=device,
+            )
+
+            logits, kv_cache = model(
+                input_ids,
+                kv_cache=kv_cache,
+                use_cache=True,
+            )
+
+            next_token_id = torch.argmax(
+                logits[0, -1]
+            ).item()
+
+            generated_ids.append(next_token_id)
+
+    return generated_ids
+
+
+# Checks that both generation implementations produce exactly the same tokens.
+def verify_generation_parity(model, prompt_ids, device):
+    test_tokens = 50
+
+    naive_ids = generate_naive(
+        model,
+        prompt_ids,
+        device,
+        test_tokens,
+    )
+
+    cached_ids = generate_cached(
+        model,
+        prompt_ids,
+        device,
+        test_tokens,
+    )
+
+    if naive_ids != cached_ids:
+        raise RuntimeError(
+            "Naive and KV-cached generation produced different token sequences."
+        )
+
+    print(
+        f"Generation parity: PASSED "
+        f"({test_tokens} generated tokens)"
+    )
+
+
+# Measures one generation implementation over several identical runs.
+def benchmark_generation_method(
+    generation_function,
+    model,
+    prompt_ids,
+    device,
+):
+    generation_function(
         model,
         prompt_ids,
         device,
@@ -177,11 +259,15 @@ def benchmark_generation(model, prompt_ids, device):
 
     measured_times = []
 
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
     for _ in range(GENERATION_MEASURED_RUNS):
         synchronize(device)
+
         start_time = time.perf_counter()
 
-        generate_naive(
+        generation_function(
             model,
             prompt_ids,
             device,
@@ -189,42 +275,50 @@ def benchmark_generation(model, prompt_ids, device):
         )
 
         synchronize(device)
-        elapsed_time = time.perf_counter() - start_time
 
+        elapsed_time = time.perf_counter() - start_time
         measured_times.append(elapsed_time)
 
     average_time = sum(measured_times) / len(measured_times)
-    tokens_per_second = GENERATION_TOKENS / average_time
-    milliseconds_per_token = average_time / GENERATION_TOKENS * 1000
 
-    return average_time, tokens_per_second, milliseconds_per_token
+    tokens_per_second = (
+        GENERATION_TOKENS / average_time
+    )
+
+    milliseconds_per_token = (
+        average_time / GENERATION_TOKENS * 1000
+    )
+
+    peak_memory_gb = None
+
+    if device.type == "cuda":
+        peak_memory_gb = (
+            torch.cuda.max_memory_allocated()
+            / 1024**3
+        )
+
+    return {
+        "time": average_time,
+        "tokens_per_second": tokens_per_second,
+        "milliseconds_per_token": milliseconds_per_token,
+        "peak_memory_gb": peak_memory_gb,
+    }
 
 
-# Prints current accelerator memory usage when supported by the backend.
-def print_memory_usage(device):
-    if device.type != "cuda":
-        return
-
-    allocated_gb = torch.cuda.memory_allocated() / 1024**3
-    reserved_gb = torch.cuda.memory_reserved() / 1024**3
-
-    print(f"GPU memory allocated: {allocated_gb:.2f} GB")
-    print(f"GPU memory reserved: {reserved_gb:.2f} GB")
-
-
-# Runs prompt-processing and naive autoregressive-generation benchmarks.
+# Runs prompt-processing and naive-versus-KV-cache generation benchmarks.
 def main():
     device = get_device()
 
     print_device_info(device)
     print(f"Checkpoint: {FINAL_CHECKPOINT}")
-    print("Inference mode: naive full-context recomputation")
-    print("KV cache: disabled\n")
+    print(f"Context length: {CONTEXT_LENGTH}\n")
 
     tokenizer = load_tokenizer()
     model = load_model(device)
 
-    benchmark_tokens = create_benchmark_tokens(tokenizer)
+    benchmark_tokens = create_benchmark_tokens(
+        tokenizer
+    )
 
     print("Prompt processing\n")
 
@@ -237,12 +331,16 @@ def main():
     print("-" * 36)
 
     for prompt_length in PREFILL_LENGTHS:
-        prompt_ids = benchmark_tokens[:prompt_length]
+        prompt_ids = benchmark_tokens[
+            :prompt_length
+        ]
 
-        seconds_per_run, tokens_per_second = benchmark_prefill(
-            model,
-            prompt_ids,
-            device,
+        seconds_per_run, tokens_per_second = (
+            benchmark_prefill(
+                model,
+                prompt_ids,
+                device,
+            )
         )
 
         milliseconds = seconds_per_run * 1000
@@ -253,26 +351,96 @@ def main():
             f"{tokens_per_second:>12,.0f}"
         )
 
-    generation_prompt = benchmark_tokens[:GENERATION_PROMPT_LENGTH]
+    generation_prompt = benchmark_tokens[
+        :GENERATION_PROMPT_LENGTH
+    ]
 
-    print("\nNaive autoregressive generation\n")
-    print(f"Prompt length: {GENERATION_PROMPT_LENGTH} tokens")
-    print(f"Generated tokens per run: {GENERATION_TOKENS}")
-    print(f"Measured runs: {GENERATION_MEASURED_RUNS}")
+    print("\nGeneration benchmark\n")
+    print(
+        f"Prompt length: "
+        f"{GENERATION_PROMPT_LENGTH} tokens"
+    )
+    print(
+        f"Generated tokens per run: "
+        f"{GENERATION_TOKENS}"
+    )
+    print(
+        f"Measured runs: "
+        f"{GENERATION_MEASURED_RUNS}\n"
+    )
 
-    average_time, tokens_per_second, milliseconds_per_token = benchmark_generation(
+    verify_generation_parity(
         model,
         generation_prompt,
         device,
     )
 
-    print(f"\nAverage generation time: {average_time:.3f} s")
-    print(f"Generation throughput: {tokens_per_second:,.2f} tokens/s")
-    print(f"Latency per generated token: {milliseconds_per_token:.3f} ms")
+    print("\nBenchmarking naive generation...")
 
-    print_memory_usage(device)
+    naive_result = benchmark_generation_method(
+        generate_naive,
+        model,
+        generation_prompt,
+        device,
+    )
 
-    print("\nBaseline inference benchmark: PASSED")
+    print("Benchmarking KV-cached generation...")
+
+    cached_result = benchmark_generation_method(
+        generate_cached,
+        model,
+        generation_prompt,
+        device,
+    )
+
+    speedup = (
+        cached_result["tokens_per_second"]
+        / naive_result["tokens_per_second"]
+    )
+
+    print("\nGeneration results\n")
+
+    print(
+        f"{'Method':>12} "
+        f"{'Time (s)':>10} "
+        f"{'Tokens/s':>12} "
+        f"{'ms/token':>12} "
+        f"{'Peak GB':>10}"
+    )
+
+    print("-" * 62)
+
+    print(
+        f"{'Naive':>12} "
+        f"{naive_result['time']:>10.3f} "
+        f"{naive_result['tokens_per_second']:>12,.2f} "
+        f"{naive_result['milliseconds_per_token']:>12.3f} "
+        f"{naive_result['peak_memory_gb']:>10.3f}"
+    )
+
+    print(
+        f"{'KV cache':>12} "
+        f"{cached_result['time']:>10.3f} "
+        f"{cached_result['tokens_per_second']:>12,.2f} "
+        f"{cached_result['milliseconds_per_token']:>12.3f} "
+        f"{cached_result['peak_memory_gb']:>10.3f}"
+    )
+
+    print(f"\nKV-cache speedup: {speedup:.2f}x")
+
+    if speedup > 1:
+        reduction = (
+            1
+            - cached_result["milliseconds_per_token"]
+            / naive_result["milliseconds_per_token"]
+        ) * 100
+
+        print(
+            f"Latency reduction: "
+            f"{reduction:.1f}%"
+        )
+
+    print("\nInference comparison benchmark: PASSED")
 
 
 if __name__ == "__main__":
