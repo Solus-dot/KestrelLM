@@ -91,10 +91,18 @@ class RMSNorm(nn.Module):
 
 
 # Implements multi-head causal self-attention.
-# During cached inference, previously computed keys and values are reused.
+# The manual backend exposes the attention math directly, while the SDPA backend
+# delegates the same operation to PyTorch's optimized scaled-attention primitive.
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self):
+    def __init__(self, attention_backend="manual"):
         super().__init__()
+
+        if attention_backend not in {"manual", "sdpa"}:
+            raise ValueError(
+                "attention_backend must be either 'manual' or 'sdpa'."
+            )
+
+        self.attention_backend = attention_backend
 
         self.query_projection = nn.Linear(D_MODEL, D_MODEL, bias=False)
         self.key_projection = nn.Linear(D_MODEL, D_MODEL, bias=False)
@@ -164,6 +172,29 @@ class MultiHeadSelfAttention(nn.Module):
             float("-inf"),
         )
 
+    # Builds the equivalent boolean mask for PyTorch SDPA.
+    # True means that a query is allowed to attend to that key position.
+    def create_sdpa_causal_mask(self, query_length, key_length, device):
+        past_length = key_length - query_length
+
+        query_positions = (
+            torch.arange(
+                query_length,
+                device=device,
+            )
+            + past_length
+        )
+
+        key_positions = torch.arange(
+            key_length,
+            device=device,
+        )
+
+        return (
+            key_positions.unsqueeze(0)
+            <= query_positions.unsqueeze(1)
+        )
+
     # Converts masked scores into attention probabilities.
     def compute_attention_weights(self, masked_scores):
         return torch.softmax(masked_scores, dim=-1)
@@ -171,6 +202,45 @@ class MultiHeadSelfAttention(nn.Module):
     # Mixes the value vectors using the attention probabilities.
     def compute_attention_output(self, attention_weights, value):
         return torch.matmul(attention_weights, value)
+
+    # Executes the handwritten scaled dot-product attention implementation.
+    def manual_attention(self, query, key, value):
+        scores = self.compute_attention_scores(
+            query,
+            key,
+        )
+
+        masked_scores = self.apply_causal_mask(scores)
+
+        attention_weights = self.compute_attention_weights(
+            masked_scores
+        )
+
+        return self.compute_attention_output(
+            attention_weights,
+            value,
+        )
+
+    # Executes the same causal attention operation using PyTorch SDPA.
+    # An explicit mask is used so cached queries attend to the full past prefix.
+    def sdpa_attention(self, query, key, value):
+        query_length = query.shape[-2]
+        key_length = key.shape[-2]
+
+        causal_mask = self.create_sdpa_causal_mask(
+            query_length,
+            key_length,
+            query.device,
+        )
+
+        return F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=causal_mask,
+            dropout_p=0.0,
+            is_causal=False,
+        )
 
     # kv_cache contains the keys and values computed by this layer previously.
     # When use_cache is True, the updated cache is returned with the output.
@@ -200,21 +270,19 @@ class MultiHeadSelfAttention(nn.Module):
                 dim=-2,
             )
 
-        scores = self.compute_attention_scores(
-            query,
-            key,
-        )
+        if self.attention_backend == "manual":
+            head_output = self.manual_attention(
+                query,
+                key,
+                value,
+            )
 
-        masked_scores = self.apply_causal_mask(scores)
-
-        attention_weights = self.compute_attention_weights(
-            masked_scores
-        )
-
-        head_output = self.compute_attention_output(
-            attention_weights,
-            value,
-        )
+        else:
+            head_output = self.sdpa_attention(
+                query,
+                key,
+                value,
+            )
 
         combined_output = self.combine_heads(head_output)
         output = self.output_projection(combined_output)
@@ -262,11 +330,13 @@ class SwiGLU(nn.Module):
 # Implements one complete pre-norm decoder transformer block.
 # Each block owns one layer of the KV cache during inference.
 class TransformerBlock(nn.Module):
-    def __init__(self):
+    def __init__(self, attention_backend="manual"):
         super().__init__()
 
         self.attention_norm = RMSNorm()
-        self.attention = MultiHeadSelfAttention()
+        self.attention = MultiHeadSelfAttention(
+            attention_backend=attention_backend
+        )
 
         self.feed_forward_norm = RMSNorm()
         self.feed_forward = SwiGLU()
@@ -305,14 +375,16 @@ class TransformerBlock(nn.Module):
 
 
 # Stacks N_LAYERS independent transformer blocks.
-# A KV-cache entry is maintained independently for every transformer layer.
+# Every layer uses the same selected attention backend.
 class TransformerStack(nn.Module):
-    def __init__(self):
+    def __init__(self, attention_backend="manual"):
         super().__init__()
 
         self.blocks = nn.ModuleList(
             [
-                TransformerBlock()
+                TransformerBlock(
+                    attention_backend=attention_backend
+                )
                 for _ in range(N_LAYERS)
             ]
         )
@@ -352,13 +424,17 @@ class TransformerStack(nn.Module):
 
 
 # Implements the complete decoder-only KestrelLM language model.
-# Normal forward calls remain unchanged, while use_cache enables cached inference.
+# Manual attention remains the default; SDPA can be selected for benchmarking.
 class KestrelLM(nn.Module):
-    def __init__(self):
+    def __init__(self, attention_backend="manual"):
         super().__init__()
 
+        self.attention_backend = attention_backend
+
         self.input_embedding = InputEmbedding()
-        self.transformer = TransformerStack()
+        self.transformer = TransformerStack(
+            attention_backend=attention_backend
+        )
         self.final_norm = RMSNorm()
         self.lm_head = nn.Linear(
             D_MODEL,
