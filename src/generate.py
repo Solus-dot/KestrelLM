@@ -1,13 +1,19 @@
 import argparse
+from pathlib import Path
 
 import torch
+from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
 
-from config import CHECKPOINT_DIR, CONTEXT_LENGTH, EOS_TOKEN, TOKENIZER_PATH
+from config import CHECKPOINT_DIR, CONTEXT_LENGTH, EOS_TOKEN, PROJECT_ROOT, TOKENIZER_PATH
 from model import KestrelLM
 
 
-FINAL_CHECKPOINT = CHECKPOINT_DIR / "final_600m.pt"
+HF_REPO_ID = "SolusBolus/KestrelLM"
+HF_MODEL_FILENAME = "kestrel-30m.pt"
+
+LOCAL_RELEASE_CHECKPOINT = PROJECT_ROOT / "release" / HF_MODEL_FILENAME
+LOCAL_TRAINING_CHECKPOINT = CHECKPOINT_DIR / "final_600m.pt"
 
 
 # Chooses an AMD/NVIDIA GPU first, Apple MPS second, and CPU otherwise.
@@ -49,14 +55,43 @@ def load_tokenizer():
     return Tokenizer.from_file(str(TOKENIZER_PATH))
 
 
-# Loads the final pretrained KestrelLM checkpoint for inference.
-# Optimizer state is unnecessary because generation performs no updates.
-def load_model(device):
-    if not FINAL_CHECKPOINT.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {FINAL_CHECKPOINT}")
+# Finds a local model checkpoint when available.
+# The smaller inference-only release checkpoint is preferred over the training checkpoint.
+def find_local_checkpoint():
+    if LOCAL_RELEASE_CHECKPOINT.exists():
+        return LOCAL_RELEASE_CHECKPOINT
 
+    if LOCAL_TRAINING_CHECKPOINT.exists():
+        return LOCAL_TRAINING_CHECKPOINT
+
+    return None
+
+
+# Returns a usable checkpoint path.
+# If no local checkpoint exists, the published model is downloaded and cached by Hugging Face.
+def resolve_checkpoint():
+    local_checkpoint = find_local_checkpoint()
+
+    if local_checkpoint is not None:
+        print(f"Using local checkpoint: {local_checkpoint}")
+        return local_checkpoint
+
+    print(f"Local checkpoint not found.")
+    print(f"Downloading {HF_MODEL_FILENAME} from {HF_REPO_ID}...")
+
+    downloaded_path = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=HF_MODEL_FILENAME,
+    )
+
+    return Path(downloaded_path)
+
+
+# Loads the pretrained KestrelLM weights for inference.
+# Optimizer state is unnecessary because generation performs no training updates.
+def load_model(checkpoint_path, device):
     checkpoint = torch.load(
-        FINAL_CHECKPOINT,
+        checkpoint_path,
         map_location="cpu",
         weights_only=False,
     )
@@ -200,7 +235,7 @@ def generate(
                 )
 
             else:
-                # The learned positional embeddings only cover positions 0-511.
+                # Learned positional embeddings only cover positions 0-511.
                 # Rebuild the cache from the newest context window once it is full.
                 logits, kv_cache = prefill_context(
                     model,
@@ -280,7 +315,7 @@ def validate_arguments(args):
         raise ValueError("top-p must be greater than 0 and at most 1.")
 
 
-# Loads the final model and tokenizer, generates text, and prints the result.
+# Loads the pretrained model and tokenizer, generates text, and prints the result.
 def main():
     args = parse_arguments()
     validate_arguments(args)
@@ -290,7 +325,10 @@ def main():
     device = get_device()
 
     print_device_info(device)
-    print(f"Checkpoint: {FINAL_CHECKPOINT}")
+
+    checkpoint_path = resolve_checkpoint()
+
+    print(f"Checkpoint: {checkpoint_path}")
     print("KV cache: enabled")
     print(f"Temperature: {args.temperature}")
     print(f"Top-k: {args.top_k}")
@@ -298,7 +336,7 @@ def main():
     print(f"Max new tokens: {args.max_new_tokens}\n")
 
     tokenizer = load_tokenizer()
-    model = load_model(device)
+    model = load_model(checkpoint_path, device)
 
     generated_text = generate(
         model=model,
