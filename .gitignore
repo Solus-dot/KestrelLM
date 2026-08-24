@@ -1,3 +1,4 @@
+# .gitignore
 .venv/
 __pycache__/
 *.pyc
@@ -5,5 +6,6 @@ __pycache__/
 data/
 checkpoints/
 results/
+release/
 
 .DS_Store
