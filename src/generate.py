@@ -10,7 +10,7 @@ from model import KestrelLM
 
 
 HF_REPO_ID = "SolusBolus/KestrelLM"
-HF_MODEL_FILENAME = "kestrel-30m.pt"
+HF_MODEL_FILENAME = "kestrel_30m.pt"
 
 LOCAL_RELEASE_CHECKPOINT = PROJECT_ROOT / "release" / HF_MODEL_FILENAME
 LOCAL_TRAINING_CHECKPOINT = CHECKPOINT_DIR / "final_600m.pt"
