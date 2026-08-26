@@ -1,5 +1,7 @@
+import argparse
 import math
 import os
+from dataclasses import asdict
 
 import torch
 from tqdm import tqdm
@@ -10,15 +12,16 @@ from config import (
     BATCH_SIZE,
     CHECKPOINT_DIR,
     CHECKPOINT_INTERVAL,
-    CONTEXT_LENGTH,
     GRADIENT_ACCUMULATION_STEPS,
+    KESTREL_LARGE,
+    KESTREL_MEDIUM,
+    KESTREL_SMALL,
     LATEST_CHECKPOINT,
     LEARNING_RATE,
     MAX_GRAD_NORM,
     MILESTONE_CHECKPOINT_INTERVAL,
     MIN_LEARNING_RATE,
     RESUME_CHECKPOINT,
-    RUN_UNTIL_STEP,
     TRAINING_STEPS,
     VALIDATION_BATCHES,
     VALIDATION_INTERVAL,
@@ -26,11 +29,47 @@ from config import (
     WEIGHT_DECAY,
 )
 from dataloader import create_train_dataloader, create_validation_dataloader
-from model import KestrelLM, compute_loss
+from model import KestrelLM, compute_loss, count_parameters
+
+
+MODEL_CONFIGS = {
+    "small": KESTREL_SMALL,
+    "medium": KESTREL_MEDIUM,
+    "large": KESTREL_LARGE,
+}
+
+
+# Reads the model size, training length, and checkpoint location for this run.
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--model",
+        choices=MODEL_CONFIGS,
+        default="medium",
+    )
+
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=TRAINING_STEPS,
+    )
+
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+    )
+
+    return parser.parse_args()
 
 
 # Chooses an AMD/NVIDIA GPU first, Apple MPS second, and CPU otherwise.
-# PyTorch exposes AMD ROCm GPUs through the torch.cuda interface.
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -87,12 +126,12 @@ def create_optimizer(model):
     )
 
 
-# Uses linear warmup followed by cosine decay over the complete training schedule.
-def get_learning_rate(step):
+# Uses linear warmup followed by cosine decay over this run's training schedule.
+def get_learning_rate(step, training_steps):
     if step <= WARMUP_STEPS:
         return LEARNING_RATE * step / WARMUP_STEPS
 
-    decay_steps = TRAINING_STEPS - WARMUP_STEPS
+    decay_steps = training_steps - WARMUP_STEPS
     decay_progress = (step - WARMUP_STEPS) / decay_steps
     cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
 
@@ -137,11 +176,11 @@ def create_checkpoint(model, optimizer, global_step, data_pass, tokens_processed
         "global_step": global_step,
         "data_pass": data_pass,
         "tokens_processed": tokens_processed,
+        "model_config": asdict(model.config),
     }
 
 
 # Writes to a temporary file before atomically replacing the destination.
-# An interrupted save therefore cannot corrupt an existing valid checkpoint.
 def atomic_save(checkpoint, checkpoint_path):
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -150,25 +189,36 @@ def atomic_save(checkpoint, checkpoint_path):
     os.replace(temporary_path, checkpoint_path)
 
 
-# Updates latest.pt and creates permanent milestone checkpoints when configured.
-def save_checkpoint(model, optimizer, global_step, data_pass, tokens_processed):
+# Saves the rolling checkpoint and configured milestone checkpoints.
+def save_checkpoint(
+    model,
+    optimizer,
+    global_step,
+    data_pass,
+    tokens_processed,
+    checkpoint_dir,
+):
     checkpoint = create_checkpoint(
-        model, optimizer, global_step, data_pass, tokens_processed
+        model,
+        optimizer,
+        global_step,
+        data_pass,
+        tokens_processed,
     )
 
-    atomic_save(checkpoint, LATEST_CHECKPOINT)
+    latest_checkpoint = checkpoint_dir / "latest.pt"
+    atomic_save(checkpoint, latest_checkpoint)
 
     milestone_path = None
 
     if global_step % MILESTONE_CHECKPOINT_INTERVAL == 0:
-        milestone_path = CHECKPOINT_DIR / f"step_{global_step}.pt"
+        milestone_path = checkpoint_dir / f"step_{global_step}.pt"
         atomic_save(checkpoint, milestone_path)
 
-    return milestone_path
+    return latest_checkpoint, milestone_path
 
 
-# Moves all tensor-valued optimizer state to the selected accelerator.
-# This makes checkpoints portable between MPS, ROCm, CUDA, and CPU systems.
+# Moves optimizer state tensors to the selected accelerator after loading.
 def move_optimizer_state_to_device(optimizer, device):
     for state in optimizer.state.values():
         for key, value in state.items():
@@ -177,18 +227,18 @@ def move_optimizer_state_to_device(optimizer, device):
 
 
 # Restores model parameters, AdamW state, and training counters.
-# The checkpoint is first loaded onto CPU so checkpoints remain cross-platform.
 def load_checkpoint(model, optimizer, checkpoint_path, device):
     if checkpoint_path is None:
         return 0, 0, 0
 
     if not checkpoint_path.exists():
-        raise FileNotFoundError(
-            f"Checkpoint not found: {checkpoint_path}\n"
-            "Training was configured to resume, so refusing to start from scratch."
-        )
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
 
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -201,58 +251,78 @@ def load_checkpoint(model, optimizer, checkpoint_path, device):
     return global_step, data_pass, tokens_processed
 
 
-# Restores the configured checkpoint or starts fresh when resume is explicitly disabled.
-def initialize_training_state(model, optimizer, device):
-    return load_checkpoint(model, optimizer, RESUME_CHECKPOINT, device)
-
-
-# Runs pretraining with gradient accumulation, LR scheduling, validation,
-# gradient clipping, checkpointing, and safe interruption handling.
+# Runs pretraining for the selected model configuration.
 def main():
+    args = parse_args()
+
+    if args.steps <= WARMUP_STEPS:
+        raise ValueError(
+            f"Training steps must exceed the {WARMUP_STEPS}-step warmup."
+        )
+
+    model_config = MODEL_CONFIGS[args.model]
+
+    if args.run_name is None:
+        checkpoint_dir = CHECKPOINT_DIR
+        resume_checkpoint = LATEST_CHECKPOINT if args.resume else RESUME_CHECKPOINT
+    else:
+        checkpoint_dir = CHECKPOINT_DIR / args.run_name
+        resume_checkpoint = checkpoint_dir / "latest.pt" if args.resume else None
+
+    final_checkpoint = checkpoint_dir / "final.pt"
+
+    torch.manual_seed(42)
+
     device = get_device()
 
     train_loader = create_train_dataloader()
     validation_loader = create_validation_dataloader()
 
-    model = KestrelLM().to(device)
+    model = KestrelLM(config=model_config).to(device)
     optimizer = create_optimizer(model)
 
-    global_step, data_pass, tokens_processed = initialize_training_state(
-        model, optimizer, device
+    global_step, data_pass, tokens_processed = load_checkpoint(
+        model,
+        optimizer,
+        resume_checkpoint,
+        device,
     )
 
-    microbatch_tokens = BATCH_SIZE * CONTEXT_LENGTH
+    microbatch_tokens = BATCH_SIZE * model_config.context_length
     effective_batch_size = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS
-    tokens_per_optimizer_step = microbatch_tokens * GRADIENT_ACCUMULATION_STEPS
-    total_training_tokens = TRAINING_STEPS * tokens_per_optimizer_step
-    remaining_steps = RUN_UNTIL_STEP - global_step
+    tokens_per_optimizer_step = (
+        microbatch_tokens * GRADIENT_ACCUMULATION_STEPS
+    )
+
+    total_training_tokens = args.steps * tokens_per_optimizer_step
+    remaining_steps = args.steps - global_step
     remaining_tokens = total_training_tokens - tokens_processed
 
-    if RUN_UNTIL_STEP > TRAINING_STEPS:
-        raise ValueError("RUN_UNTIL_STEP cannot exceed TRAINING_STEPS.")
-
-    if global_step >= RUN_UNTIL_STEP:
+    if global_step >= args.steps:
         raise ValueError(
             f"Checkpoint is already at step {global_step}, "
-            f"but this invocation stops at step {RUN_UNTIL_STEP}."
+            f"but this run ends at step {args.steps}."
         )
 
     print_device_info(device)
 
-    if RESUME_CHECKPOINT is None:
+    print(f"\nModel: {model_config.name}")
+    print(f"Parameters: {count_parameters(model):,}")
+    print(f"Checkpoint directory: {checkpoint_dir}")
+
+    if resume_checkpoint is None:
         print("Starting new training run")
     else:
-        print(f"Resumed from: {RESUME_CHECKPOINT}")
+        print(f"Resumed from: {resume_checkpoint}")
         print(f"Starting optimizer step: {global_step:,}")
         print(f"Previously processed tokens: {tokens_processed:,}")
 
     print(f"Physical batch size: {BATCH_SIZE}")
     print(f"Gradient accumulation steps: {GRADIENT_ACCUMULATION_STEPS}")
     print(f"Effective batch size: {effective_batch_size}")
-    print(f"Tokens per microbatch: {microbatch_tokens:,}")
     print(f"Tokens per optimizer step: {tokens_per_optimizer_step:,}")
-    print(f"Full training steps: {TRAINING_STEPS:,}")
-    print(f"Full training tokens: {total_training_tokens:,}")
+    print(f"Training steps: {args.steps:,}")
+    print(f"Training tokens: {total_training_tokens:,}")
     print(f"Remaining optimizer steps: {remaining_steps:,}")
     print(f"Remaining training tokens: {remaining_tokens:,}")
     print(f"Peak learning rate: {LEARNING_RATE}")
@@ -262,9 +332,7 @@ def main():
     print(f"Weight decay: {WEIGHT_DECAY}")
     print(f"Maximum gradient norm: {MAX_GRAD_NORM}")
     print(f"Validation interval: {VALIDATION_INTERVAL:,}")
-    print(f"Validation batches: {VALIDATION_BATCHES:,}")
-    print(f"Checkpoint interval: {CHECKPOINT_INTERVAL:,}")
-    print(f"Milestone interval: {MILESTONE_CHECKPOINT_INTERVAL:,}\n")
+    print(f"Validation batches: {VALIDATION_BATCHES:,}\n")
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -274,15 +342,18 @@ def main():
     accumulated_tokens = 0
 
     progress_bar = tqdm(
-        total=RUN_UNTIL_STEP, initial=global_step, desc="Training", unit="step"
+        total=args.steps,
+        initial=global_step,
+        desc=f"Training {model_config.name}",
+        unit="step",
     )
 
     try:
-        while global_step < RUN_UNTIL_STEP:
+        while global_step < args.steps:
             data_pass += 1
 
             for x, y in train_loader:
-                if global_step >= RUN_UNTIL_STEP:
+                if global_step >= args.steps:
                     break
 
                 x = x.to(device)
@@ -303,11 +374,19 @@ def main():
 
                 global_step += 1
 
-                learning_rate = get_learning_rate(global_step)
-                set_learning_rate(optimizer, learning_rate)
+                learning_rate = get_learning_rate(
+                    global_step,
+                    args.steps,
+                )
+
+                set_learning_rate(
+                    optimizer,
+                    learning_rate,
+                )
 
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), MAX_GRAD_NORM
+                    model.parameters(),
+                    MAX_GRAD_NORM,
                 )
 
                 optimizer.step()
@@ -325,6 +404,7 @@ def main():
                     grad_norm=f"{gradient_norm.item():.2f}",
                     tokens=f"{tokens_processed:,}",
                 )
+
                 progress_bar.update(1)
 
                 accumulation_step = 0
@@ -332,7 +412,11 @@ def main():
                 accumulated_tokens = 0
 
                 if global_step % VALIDATION_INTERVAL == 0:
-                    validation_loss = evaluate(model, validation_loader, device)
+                    validation_loss = evaluate(
+                        model,
+                        validation_loader,
+                        device,
+                    )
 
                     progress_bar.write(
                         f"Step {global_step:,} | "
@@ -347,43 +431,81 @@ def main():
                     model.train()
 
                 if global_step % CHECKPOINT_INTERVAL == 0:
-                    milestone_path = save_checkpoint(
-                        model, optimizer, global_step, data_pass, tokens_processed
+                    latest_checkpoint, milestone_path = save_checkpoint(
+                        model,
+                        optimizer,
+                        global_step,
+                        data_pass,
+                        tokens_processed,
+                        checkpoint_dir,
                     )
 
-                    progress_bar.write(f"Updated checkpoint: {LATEST_CHECKPOINT}")
+                    progress_bar.write(
+                        f"Updated checkpoint: {latest_checkpoint}"
+                    )
 
                     if milestone_path is not None:
-                        progress_bar.write(f"Saved milestone: {milestone_path}")
+                        progress_bar.write(
+                            f"Saved milestone: {milestone_path}"
+                        )
 
     except KeyboardInterrupt:
         progress_bar.write("\nTraining interrupted.")
 
-        milestone_path = save_checkpoint(
-            model, optimizer, global_step, data_pass, tokens_processed
+        latest_checkpoint, milestone_path = save_checkpoint(
+            model,
+            optimizer,
+            global_step,
+            data_pass,
+            tokens_processed,
+            checkpoint_dir,
         )
 
         progress_bar.write(
-            f"Saved completed state at step {global_step:,} "
+            f"Saved state at step {global_step:,} "
             f"and {tokens_processed:,} tokens."
         )
-        progress_bar.write(f"Latest checkpoint: {LATEST_CHECKPOINT}")
+
+        progress_bar.write(
+            f"Latest checkpoint: {latest_checkpoint}"
+        )
 
         if milestone_path is not None:
-            progress_bar.write(f"Milestone checkpoint: {milestone_path}")
+            progress_bar.write(
+                f"Milestone checkpoint: {milestone_path}"
+            )
 
         progress_bar.close()
         return
 
-    milestone_path = save_checkpoint(
-        model, optimizer, global_step, data_pass, tokens_processed
+    checkpoint = create_checkpoint(
+        model,
+        optimizer,
+        global_step,
+        data_pass,
+        tokens_processed,
+    )
+
+    atomic_save(
+        checkpoint,
+        final_checkpoint,
+    )
+
+    latest_checkpoint, milestone_path = save_checkpoint(
+        model,
+        optimizer,
+        global_step,
+        data_pass,
+        tokens_processed,
+        checkpoint_dir,
     )
 
     progress_bar.close()
 
     print(f"\nFinal optimizer step: {global_step:,}")
     print(f"Total tokens processed: {tokens_processed:,}")
-    print(f"Latest checkpoint: {LATEST_CHECKPOINT}")
+    print(f"Final checkpoint: {final_checkpoint}")
+    print(f"Latest checkpoint: {latest_checkpoint}")
 
     if milestone_path is not None:
         print(f"Milestone checkpoint: {milestone_path}")

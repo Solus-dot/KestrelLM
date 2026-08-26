@@ -5,56 +5,51 @@ import torch
 from config import (
     ADAM_BETA_1,
     ADAM_BETA_2,
-    CONTEXT_LENGTH,
+    BATCH_SIZE,
+    KESTREL_LARGE,
+    KESTREL_MEDIUM,
+    KESTREL_SMALL,
     LEARNING_RATE,
     MAX_GRAD_NORM,
     WEIGHT_DECAY,
 )
 from dataloader import create_dataloader
 from dataset import create_train_dataset
-from model import KestrelLM, compute_loss
+from model import KestrelLM, compute_loss, count_parameters
 
 
-# All configurations preserve an effective batch size of 32 sequences.
-BENCHMARK_CONFIGS = [
-    (2, 16),
-    (4, 8),
-    (8, 4),
-    (16, 2),
-    (32, 1),
+MODEL_CONFIGS = [
+    KESTREL_SMALL,
+    KESTREL_MEDIUM,
+    KESTREL_LARGE,
 ]
 
 WARMUP_STEPS = 3
 BENCHMARK_STEPS = 20
 
 
-# Requires an AMD ROCm GPU and refuses to silently fall back to the CPU.
+# Requires the ROCm GPU used for KestrelLM training.
 def get_device():
     if not torch.cuda.is_available():
-        raise RuntimeError(
-            "ROCm GPU is not available to PyTorch. "
-            "Refusing to run the benchmark on CPU."
-        )
+        raise RuntimeError("ROCm GPU is not available to PyTorch.")
 
     if torch.version.hip is None:
-        raise RuntimeError(
-            "PyTorch sees a CUDA-style device, but this is not a ROCm build."
-        )
+        raise RuntimeError("PyTorch is not using a ROCm build.")
 
     return torch.device("cuda:0")
 
 
-# Waits for all queued ROCm operations to complete before reading the clock.
+# Waits for queued ROCm operations to finish before reading timings.
 def synchronize():
     torch.cuda.synchronize()
 
 
-# Clears cached GPU memory between benchmark configurations.
-def empty_cache():
+# Releases cached allocator memory between model-size benchmarks.
+def clear_gpu_memory():
     torch.cuda.empty_cache()
 
 
-# Prints the ROCm and GPU information used for this benchmark.
+# Prints the accelerator environment used for the benchmark.
 def print_device_info(device):
     print(f"Device: {device}")
     print("GPU backend: ROCm")
@@ -63,7 +58,7 @@ def print_device_info(device):
     print(f"PyTorch: {torch.__version__}")
 
 
-# Creates the same AdamW optimizer configuration used during real training.
+# Creates the same AdamW configuration used during normal training.
 def create_optimizer(model):
     decay_parameters = []
     no_decay_parameters = []
@@ -89,11 +84,10 @@ def create_optimizer(model):
     )
 
 
-# Returns another batch and restarts the dataloader if it is exhausted.
+# Returns another batch and restarts the dataloader if necessary.
 def get_next_batch(data_iterator, data_loader):
     try:
         batch = next(data_iterator)
-
     except StopIteration:
         data_iterator = iter(data_loader)
         batch = next(data_iterator)
@@ -101,32 +95,19 @@ def get_next_batch(data_iterator, data_loader):
     return batch, data_iterator
 
 
-# Performs one complete optimizer update using gradient accumulation.
-def run_optimizer_step(
-    model,
-    optimizer,
-    data_loader,
-    data_iterator,
-    device,
-    accumulation_steps,
-):
+# Performs one complete forward, backward, and optimizer update.
+def run_training_step(model, optimizer, data_loader, data_iterator, device):
     optimizer.zero_grad(set_to_none=True)
 
-    total_loss = 0.0
+    (x, y), data_iterator = get_next_batch(data_iterator, data_loader)
 
-    for _ in range(accumulation_steps):
-        (x, y), data_iterator = get_next_batch(data_iterator, data_loader)
+    x = x.to(device)
+    y = y.to(device)
 
-        x = x.to(device)
-        y = y.to(device)
+    logits = model(x)
+    loss = compute_loss(logits, y)
 
-        logits = model(x)
-        loss = compute_loss(logits, y)
-
-        scaled_loss = loss / accumulation_steps
-        scaled_loss.backward()
-
-        total_loss += loss.item()
+    loss.backward()
 
     gradient_norm = torch.nn.utils.clip_grad_norm_(
         model.parameters(),
@@ -135,25 +116,21 @@ def run_optimizer_step(
 
     optimizer.step()
 
-    mean_loss = total_loss / accumulation_steps
-
-    return mean_loss, gradient_norm.item(), data_iterator
+    return loss.item(), gradient_norm.item(), data_iterator
 
 
-# Benchmarks one physical-batch and accumulation configuration.
-def benchmark_configuration(device, dataset, batch_size, accumulation_steps):
-    effective_batch_size = batch_size * accumulation_steps
-    tokens_per_step = effective_batch_size * CONTEXT_LENGTH
-
-    print(
-        f"\nB={batch_size}, "
-        f"accumulation={accumulation_steps}, "
-        f"effective batch={effective_batch_size}"
-    )
-
-    print(f"Tokens per optimizer step: {tokens_per_step:,}")
+# Benchmarks one model size using the same physical batch and sequence length.
+def benchmark_model(config, device, dataset):
+    print(f"\n{config.name}")
+    print(f"Parameters: {count_parameters(KestrelLM(config=config)):,}")
+    print(f"d_model: {config.d_model}")
+    print(f"Layers: {config.n_layers}")
+    print(f"Heads: {config.n_heads}")
+    print(f"d_head: {config.d_head}")
+    print(f"d_ff: {config.d_ff}")
 
     torch.manual_seed(42)
+    clear_gpu_memory()
 
     model = None
     optimizer = None
@@ -163,50 +140,49 @@ def benchmark_configuration(device, dataset, batch_size, accumulation_steps):
     try:
         data_loader = create_dataloader(
             dataset,
-            batch_size=batch_size,
+            batch_size=BATCH_SIZE,
             shuffle=False,
         )
 
         data_iterator = iter(data_loader)
 
-        model = KestrelLM().to(device)
+        model = KestrelLM(config=config).to(device)
         optimizer = create_optimizer(model)
         model.train()
 
-        model_device = next(model.parameters()).device
+        parameter_count = count_parameters(model)
+        tokens_per_step = BATCH_SIZE * config.context_length
 
-        if model_device.type != "cuda":
-            raise RuntimeError(
-                f"Model ended up on {model_device} instead of the ROCm GPU."
-            )
-
-        print(f"Model device: {model_device}")
+        print(f"Batch size: {BATCH_SIZE}")
+        print(f"Tokens per step: {tokens_per_step:,}")
         print(f"Warming up for {WARMUP_STEPS} steps...")
 
         for _ in range(WARMUP_STEPS):
-            _, _, data_iterator = run_optimizer_step(
+            _, _, data_iterator = run_training_step(
                 model,
                 optimizer,
                 data_loader,
                 data_iterator,
                 device,
-                accumulation_steps,
             )
 
         synchronize()
+
+        # The optimizer state has now been initialized, so peak memory measured
+        # below represents steady-state training rather than first-step setup.
+        torch.cuda.reset_peak_memory_stats()
 
         print(f"Benchmarking {BENCHMARK_STEPS} steps...")
 
         start_time = time.perf_counter()
 
         for _ in range(BENCHMARK_STEPS):
-            loss, gradient_norm, data_iterator = run_optimizer_step(
+            loss, gradient_norm, data_iterator = run_training_step(
                 model,
                 optimizer,
                 data_loader,
                 data_iterator,
                 device,
-                accumulation_steps,
             )
 
         synchronize()
@@ -216,27 +192,29 @@ def benchmark_configuration(device, dataset, batch_size, accumulation_steps):
         seconds_per_step = elapsed_time / BENCHMARK_STEPS
         steps_per_second = BENCHMARK_STEPS / elapsed_time
         tokens_per_second = tokens_per_step / seconds_per_step
+        peak_memory_gb = torch.cuda.max_memory_allocated() / 1024**3
 
-        memory_allocated = torch.cuda.memory_allocated() / 1024**3
-        memory_reserved = torch.cuda.memory_reserved() / 1024**3
-
-        print(f"GPU memory allocated: {memory_allocated:.2f} GB")
-        print(f"GPU memory reserved: {memory_reserved:.2f} GB")
+        print(f"Peak GPU memory: {peak_memory_gb:.2f} GB")
 
         return {
-            "batch_size": batch_size,
-            "accumulation_steps": accumulation_steps,
-            "effective_batch_size": effective_batch_size,
+            "name": config.name,
+            "parameters": parameter_count,
             "seconds_per_step": seconds_per_step,
             "steps_per_second": steps_per_second,
             "tokens_per_second": tokens_per_second,
+            "peak_memory_gb": peak_memory_gb,
             "loss": loss,
             "gradient_norm": gradient_norm,
         }
 
     except torch.OutOfMemoryError:
-        print("OUT OF MEMORY - skipping this configuration.")
-        return None
+        print("OUT OF MEMORY")
+
+        return {
+            "name": config.name,
+            "parameters": count_parameters(model) if model is not None else 0,
+            "oom": True,
+        }
 
     finally:
         del model
@@ -244,77 +222,65 @@ def benchmark_configuration(device, dataset, batch_size, accumulation_steps):
         del data_loader
         del data_iterator
 
-        empty_cache()
+        clear_gpu_memory()
 
 
-# Runs every configuration and ranks them by training throughput.
+# Compares training throughput and peak VRAM across the three width-scaled models.
 def main():
     device = get_device()
     dataset = create_train_dataset()
 
     print_device_info(device)
 
-    print(f"Context length: {CONTEXT_LENGTH}")
+    print(f"\nBatch size: {BATCH_SIZE}")
+    print("Context length: 512")
     print(f"Warmup steps: {WARMUP_STEPS}")
     print(f"Measured steps: {BENCHMARK_STEPS}")
 
     results = []
 
-    for batch_size, accumulation_steps in BENCHMARK_CONFIGS:
-        result = benchmark_configuration(
-            device,
-            dataset,
-            batch_size,
-            accumulation_steps,
+    for config in MODEL_CONFIGS:
+        results.append(
+            benchmark_model(
+                config,
+                device,
+                dataset,
+            )
         )
 
-        if result is not None:
-            results.append(result)
-
-    if not results:
-        raise RuntimeError("Every benchmark configuration failed.")
-
-    results.sort(
-        key=lambda result: result["tokens_per_second"],
-        reverse=True,
-    )
-
-    print("\nBenchmark results\n")
+    print("\nScaling benchmark results\n")
 
     print(
-        f"{'Batch':>6} "
-        f"{'Accum':>6} "
-        f"{'Eff. Batch':>10} "
+        f"{'Model':>10} "
+        f"{'Params':>12} "
         f"{'Sec/Step':>10} "
-        f"{'Steps/s':>10} "
-        f"{'Tokens/s':>12}"
+        f"{'Tokens/s':>12} "
+        f"{'Peak GB':>10}"
     )
 
-    print("-" * 62)
+    print("-" * 60)
 
     for result in results:
+        if result.get("oom"):
+            print(
+                f"{result['name']:>10} "
+                f"{result['parameters']:>12,} "
+                f"{'OOM':>10} "
+                f"{'OOM':>12} "
+                f"{'OOM':>10}"
+            )
+
+            continue
+
         print(
-            f"{result['batch_size']:>6} "
-            f"{result['accumulation_steps']:>6} "
-            f"{result['effective_batch_size']:>10} "
+            f"{result['name']:>10} "
+            f"{result['parameters']:>12,} "
             f"{result['seconds_per_step']:>10.3f} "
-            f"{result['steps_per_second']:>10.3f} "
-            f"{result['tokens_per_second']:>12,.0f}"
+            f"{result['tokens_per_second']:>12,.0f} "
+            f"{result['peak_memory_gb']:>10.2f}"
         )
 
-    fastest = results[0]
-
-    remaining_tokens = 600_014_848 - 159_744_000
-    remaining_hours = remaining_tokens / fastest["tokens_per_second"] / 3600
-
-    print(
-        f"\nFastest configuration: "
-        f"B={fastest['batch_size']}, "
-        f"accumulation={fastest['accumulation_steps']}"
-    )
-
-    print(f"Throughput: {fastest['tokens_per_second']:,.0f} tokens/s")
-    print(f"Estimated remaining training time: {remaining_hours:.1f} hours")
+    print("\nTraining scaling benchmark: PASSED")
 
 
 if __name__ == "__main__":

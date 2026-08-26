@@ -1,18 +1,29 @@
+import argparse
 import math
+from pathlib import Path
 
 import torch
 from tqdm import tqdm
 
-from config import CHECKPOINT_DIR
+from config import KESTREL_MEDIUM, ModelConfig
 from dataloader import create_validation_dataloader
-from model import KestrelLM, compute_loss
+from model import KestrelLM, compute_loss, count_parameters
 
 
-FINAL_CHECKPOINT = CHECKPOINT_DIR / "final_600m.pt"
+# Reads the checkpoint to evaluate from the command line.
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        required=True,
+    )
+
+    return parser.parse_args()
 
 
 # Chooses an AMD/NVIDIA GPU first, Apple MPS second, and CPU otherwise.
-# PyTorch exposes AMD ROCm GPUs through the torch.cuda interface.
 def get_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -43,8 +54,18 @@ def print_device_info(device):
         print("GPU backend: CPU")
 
 
-# Loads only the trained model parameters from the final checkpoint.
-# Optimizer state is unnecessary because evaluation performs no updates.
+# Loads the architecture stored in newer checkpoints.
+# Older Kestrel-M checkpoints fall back to the original medium configuration.
+def get_model_config(checkpoint):
+    config_data = checkpoint.get("model_config")
+
+    if config_data is None:
+        return KESTREL_MEDIUM
+
+    return ModelConfig(**config_data)
+
+
+# Loads only the trained model parameters needed for evaluation.
 def load_model(checkpoint_path, device):
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
@@ -55,7 +76,9 @@ def load_model(checkpoint_path, device):
         weights_only=False,
     )
 
-    model = KestrelLM()
+    model_config = get_model_config(checkpoint)
+
+    model = KestrelLM(config=model_config)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
@@ -63,11 +86,15 @@ def load_model(checkpoint_path, device):
     global_step = checkpoint["global_step"]
     tokens_processed = checkpoint["tokens_processed"]
 
-    return model, global_step, tokens_processed
+    return (
+        model,
+        model_config,
+        global_step,
+        tokens_processed,
+    )
 
 
 # Evaluates every validation batch and computes token-weighted average loss.
-# Weighting by token count keeps the result exact even if batch sizes differ.
 def evaluate(model, validation_loader, device):
     total_loss = 0.0
     total_tokens = 0
@@ -78,7 +105,7 @@ def evaluate(model, validation_loader, device):
         unit="batch",
     )
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for x, y in progress_bar:
             x = x.to(device)
             y = y.to(device)
@@ -104,18 +131,26 @@ def evaluate(model, validation_loader, device):
     return validation_loss, perplexity, total_tokens
 
 
-# Loads the finished model and evaluates it over the complete validation set.
+# Loads one checkpoint and evaluates it over the complete validation set.
 def main():
+    args = parse_args()
     device = get_device()
 
     print_device_info(device)
-    print(f"Checkpoint: {FINAL_CHECKPOINT}\n")
+    print(f"Checkpoint: {args.checkpoint}\n")
 
-    model, global_step, training_tokens = load_model(
-        FINAL_CHECKPOINT,
+    (
+        model,
+        model_config,
+        global_step,
+        training_tokens,
+    ) = load_model(
+        args.checkpoint,
         device,
     )
 
+    print(f"Model: {model_config.name}")
+    print(f"Parameters: {count_parameters(model):,}")
     print(f"Checkpoint step: {global_step:,}")
     print(f"Training tokens: {training_tokens:,}")
 
@@ -131,6 +166,9 @@ def main():
     )
 
     print("\nFinal evaluation")
+    print(f"Model: {model_config.name}")
+    print(f"Parameters: {count_parameters(model):,}")
+    print(f"Training tokens: {training_tokens:,}")
     print(f"Validation tokens: {validation_tokens:,}")
     print(f"Validation loss: {validation_loss:.4f}")
     print(f"Perplexity: {perplexity:.4f}")

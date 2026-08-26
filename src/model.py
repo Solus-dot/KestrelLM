@@ -4,61 +4,46 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import (
-    CONTEXT_LENGTH,
-    D_FF,
-    D_HEAD,
-    D_MODEL,
-    N_HEADS,
-    N_LAYERS,
-    VOCAB_SIZE,
-)
+from config import KESTREL_MEDIUM, VOCAB_SIZE
 
 
-# Converts integer token IDs into learned D_MODEL-dimensional vectors.
-# Input shape: (B, T)
-# Output shape: (B, T, D_MODEL)
+# Converts integer token IDs into learned embedding vectors.
 class TokenEmbedding(nn.Module):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
-        self.embedding = nn.Embedding(VOCAB_SIZE, D_MODEL)
+        self.embedding = nn.Embedding(VOCAB_SIZE, config.d_model)
 
     def forward(self, token_ids):
         return self.embedding(token_ids)
 
 
-# Creates learned embedding vectors for a range of sequence positions.
-# start_position allows cached decoding to continue from the correct position.
+# Creates learned embedding vectors for sequence positions.
+# start_position allows cached decoding to continue after an existing prefix.
 class PositionalEmbedding(nn.Module):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
-        self.embedding = nn.Embedding(CONTEXT_LENGTH, D_MODEL)
+        self.context_length = config.context_length
+        self.embedding = nn.Embedding(config.context_length, config.d_model)
 
     def forward(self, sequence_length, device, start_position=0):
         end_position = start_position + sequence_length
 
-        if end_position > CONTEXT_LENGTH:
+        if end_position > self.context_length:
             raise ValueError(
-                f"Position {end_position} exceeds "
-                f"maximum context length {CONTEXT_LENGTH}."
+                f"Position {end_position} exceeds maximum context length "
+                f"{self.context_length}."
             )
 
-        position_ids = torch.arange(
-            start_position,
-            end_position,
-            device=device,
-        )
-
+        position_ids = torch.arange(start_position, end_position, device=device)
         return self.embedding(position_ids)
 
 
-# Combines token identity and position into the initial hidden states.
-# start_position is zero during normal training and advances during cached decoding.
+# Combines token and positional embeddings into the initial hidden states.
 class InputEmbedding(nn.Module):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
-        self.token_embedding = TokenEmbedding()
-        self.position_embedding = PositionalEmbedding()
+        self.token_embedding = TokenEmbedding(config)
+        self.position_embedding = PositionalEmbedding(config)
 
     def forward(self, token_ids, start_position=0):
         sequence_length = token_ids.shape[1]
@@ -73,11 +58,9 @@ class InputEmbedding(nn.Module):
         return token_vectors + position_vectors
 
 
-# Normalizes each token vector using its root-mean-square magnitude.
-# Input shape: (B, T, D_MODEL)
-# Output shape: (B, T, D_MODEL)
+# Normalizes each hidden vector using its root-mean-square magnitude.
 class RMSNorm(nn.Module):
-    def __init__(self, dimension=D_MODEL, eps=1e-6):
+    def __init__(self, dimension, eps=1e-6):
         super().__init__()
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(dimension))
@@ -91,138 +74,77 @@ class RMSNorm(nn.Module):
 
 
 # Implements multi-head causal self-attention.
-# The manual backend exposes the attention math directly, while the SDPA backend
-# delegates the same operation to PyTorch's optimized scaled-attention primitive.
+# Manual attention remains the default, with SDPA available for comparison.
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, attention_backend="manual"):
+    def __init__(self, config, attention_backend="manual"):
         super().__init__()
 
         if attention_backend not in {"manual", "sdpa"}:
-            raise ValueError(
-                "attention_backend must be either 'manual' or 'sdpa'."
-            )
+            raise ValueError("attention_backend must be either 'manual' or 'sdpa'.")
 
+        self.config = config
         self.attention_backend = attention_backend
 
-        self.query_projection = nn.Linear(D_MODEL, D_MODEL, bias=False)
-        self.key_projection = nn.Linear(D_MODEL, D_MODEL, bias=False)
-        self.value_projection = nn.Linear(D_MODEL, D_MODEL, bias=False)
-        self.output_projection = nn.Linear(D_MODEL, D_MODEL, bias=False)
+        self.query_projection = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.key_projection = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.value_projection = nn.Linear(config.d_model, config.d_model, bias=False)
+        self.output_projection = nn.Linear(config.d_model, config.d_model, bias=False)
 
-    # Shape: (B, T, D_MODEL) -> (B, N_HEADS, T, D_HEAD)
+    # Converts (B, T, d_model) into (B, n_heads, T, d_head).
     def split_heads(self, tensor):
         batch_size, sequence_length, _ = tensor.shape
-
         tensor = tensor.view(
             batch_size,
             sequence_length,
-            N_HEADS,
-            D_HEAD,
+            self.config.n_heads,
+            self.config.d_head,
         )
 
         return tensor.transpose(1, 2)
 
-    # Shape: (B, N_HEADS, T, D_HEAD) -> (B, T, D_MODEL)
+    # Converts (B, n_heads, T, d_head) back into (B, T, d_model).
     def combine_heads(self, tensor):
         batch_size, _, sequence_length, _ = tensor.shape
-
         tensor = tensor.transpose(1, 2).contiguous()
 
-        return tensor.view(
-            batch_size,
-            sequence_length,
-            D_MODEL,
-        )
+        return tensor.view(batch_size, sequence_length, self.config.d_model)
 
-    # Computes QK^T / sqrt(D_HEAD).
-    # Query and key lengths may differ during cached decoding.
+    # Computes scaled query-key similarity scores.
     def compute_attention_scores(self, query, key):
-        key_transposed = key.transpose(-2, -1)
-        scores = torch.matmul(query, key_transposed)
+        scores = torch.matmul(query, key.transpose(-2, -1))
+        return scores / math.sqrt(self.config.d_head)
 
-        return scores / math.sqrt(D_HEAD)
-
-    # Prevents each query from attending to keys belonging to future positions.
-    # This also handles queries that begin after an existing cached prefix.
+    # Prevents queries from attending to future key positions.
+    # past_length handles the positional offset during cached decoding.
     def apply_causal_mask(self, scores):
         query_length = scores.shape[-2]
         key_length = scores.shape[-1]
         past_length = key_length - query_length
 
-        query_positions = (
-            torch.arange(
-                query_length,
-                device=scores.device,
-            )
-            + past_length
-        )
+        query_positions = torch.arange(query_length, device=scores.device) + past_length
+        key_positions = torch.arange(key_length, device=scores.device)
 
-        key_positions = torch.arange(
-            key_length,
-            device=scores.device,
-        )
+        causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+        return scores.masked_fill(causal_mask, float("-inf"))
 
-        causal_mask = (
-            key_positions.unsqueeze(0)
-            > query_positions.unsqueeze(1)
-        )
-
-        return scores.masked_fill(
-            causal_mask,
-            float("-inf"),
-        )
-
-    # Builds the equivalent boolean mask for PyTorch SDPA.
-    # True means that a query is allowed to attend to that key position.
+    # Builds the equivalent boolean mask expected by PyTorch SDPA.
     def create_sdpa_causal_mask(self, query_length, key_length, device):
         past_length = key_length - query_length
 
-        query_positions = (
-            torch.arange(
-                query_length,
-                device=device,
-            )
-            + past_length
-        )
+        query_positions = torch.arange(query_length, device=device) + past_length
+        key_positions = torch.arange(key_length, device=device)
 
-        key_positions = torch.arange(
-            key_length,
-            device=device,
-        )
+        return key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
 
-        return (
-            key_positions.unsqueeze(0)
-            <= query_positions.unsqueeze(1)
-        )
+    # Executes the handwritten attention implementation.
+    def manual_attention(self, query, key, value):
+        scores = self.compute_attention_scores(query, key)
+        masked_scores = self.apply_causal_mask(scores)
+        attention_weights = torch.softmax(masked_scores, dim=-1)
 
-    # Converts masked scores into attention probabilities.
-    def compute_attention_weights(self, masked_scores):
-        return torch.softmax(masked_scores, dim=-1)
-
-    # Mixes the value vectors using the attention probabilities.
-    def compute_attention_output(self, attention_weights, value):
         return torch.matmul(attention_weights, value)
 
-    # Executes the handwritten scaled dot-product attention implementation.
-    def manual_attention(self, query, key, value):
-        scores = self.compute_attention_scores(
-            query,
-            key,
-        )
-
-        masked_scores = self.apply_causal_mask(scores)
-
-        attention_weights = self.compute_attention_weights(
-            masked_scores
-        )
-
-        return self.compute_attention_output(
-            attention_weights,
-            value,
-        )
-
-    # Executes the same causal attention operation using PyTorch SDPA.
-    # An explicit mask is used so cached queries attend to the full past prefix.
+    # Executes the equivalent operation using PyTorch SDPA.
     def sdpa_attention(self, query, key, value):
         query_length = query.shape[-2]
         key_length = key.shape[-2]
@@ -242,50 +164,26 @@ class MultiHeadSelfAttention(nn.Module):
             is_causal=False,
         )
 
-    # kv_cache contains the keys and values computed by this layer previously.
-    # When use_cache is True, the updated cache is returned with the output.
+    # Appends newly computed keys and values to the layer's existing KV cache.
     def forward(self, hidden_states, kv_cache=None, use_cache=False):
-        query = self.query_projection(hidden_states)
-        new_key = self.key_projection(hidden_states)
-        new_value = self.value_projection(hidden_states)
-
-        query = self.split_heads(query)
-        new_key = self.split_heads(new_key)
-        new_value = self.split_heads(new_value)
+        query = self.split_heads(self.query_projection(hidden_states))
+        new_key = self.split_heads(self.key_projection(hidden_states))
+        new_value = self.split_heads(self.value_projection(hidden_states))
 
         if kv_cache is None:
             key = new_key
             value = new_value
-
         else:
             cached_key, cached_value = kv_cache
-
-            key = torch.cat(
-                (cached_key, new_key),
-                dim=-2,
-            )
-
-            value = torch.cat(
-                (cached_value, new_value),
-                dim=-2,
-            )
+            key = torch.cat((cached_key, new_key), dim=-2)
+            value = torch.cat((cached_value, new_value), dim=-2)
 
         if self.attention_backend == "manual":
-            head_output = self.manual_attention(
-                query,
-                key,
-                value,
-            )
-
+            head_output = self.manual_attention(query, key, value)
         else:
-            head_output = self.sdpa_attention(
-                query,
-                key,
-                value,
-            )
+            head_output = self.sdpa_attention(query, key, value)
 
-        combined_output = self.combine_heads(head_output)
-        output = self.output_projection(combined_output)
+        output = self.output_projection(self.combine_heads(head_output))
 
         if use_cache:
             return output, (key, value)
@@ -294,52 +192,35 @@ class MultiHeadSelfAttention(nn.Module):
 
 
 # Implements the SwiGLU feed-forward network.
-# Input shape: (B, T, D_MODEL)
-# Output shape: (B, T, D_MODEL)
 class SwiGLU(nn.Module):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
 
-        self.gate_projection = nn.Linear(
-            D_MODEL,
-            D_FF,
-            bias=False,
-        )
-
-        self.up_projection = nn.Linear(
-            D_MODEL,
-            D_FF,
-            bias=False,
-        )
-
-        self.down_projection = nn.Linear(
-            D_FF,
-            D_MODEL,
-            bias=False,
-        )
+        self.gate_projection = nn.Linear(config.d_model, config.d_ff, bias=False)
+        self.up_projection = nn.Linear(config.d_model, config.d_ff, bias=False)
+        self.down_projection = nn.Linear(config.d_ff, config.d_model, bias=False)
 
     def forward(self, hidden_states):
         gate = self.gate_projection(hidden_states)
         up = self.up_projection(hidden_states)
-
         gated = F.silu(gate) * up
 
         return self.down_projection(gated)
 
 
-# Implements one complete pre-norm decoder transformer block.
-# Each block owns one layer of the KV cache during inference.
+# Implements one pre-norm decoder transformer block.
 class TransformerBlock(nn.Module):
-    def __init__(self, attention_backend="manual"):
+    def __init__(self, config, attention_backend="manual"):
         super().__init__()
 
-        self.attention_norm = RMSNorm()
+        self.attention_norm = RMSNorm(config.d_model)
         self.attention = MultiHeadSelfAttention(
-            attention_backend=attention_backend
+            config,
+            attention_backend=attention_backend,
         )
 
-        self.feed_forward_norm = RMSNorm()
-        self.feed_forward = SwiGLU()
+        self.feed_forward_norm = RMSNorm(config.d_model)
+        self.feed_forward = SwiGLU(config)
 
     def forward(self, hidden_states, kv_cache=None, use_cache=False):
         attention_input = self.attention_norm(hidden_states)
@@ -350,22 +231,13 @@ class TransformerBlock(nn.Module):
                 kv_cache=kv_cache,
                 use_cache=True,
             )
-
         else:
-            attention_update = self.attention(
-                attention_input
-            )
+            attention_update = self.attention(attention_input)
 
         hidden_states = hidden_states + attention_update
 
-        feed_forward_input = self.feed_forward_norm(
-            hidden_states
-        )
-
-        feed_forward_update = self.feed_forward(
-            feed_forward_input
-        )
-
+        feed_forward_input = self.feed_forward_norm(hidden_states)
+        feed_forward_update = self.feed_forward(feed_forward_input)
         hidden_states = hidden_states + feed_forward_update
 
         if use_cache:
@@ -374,36 +246,31 @@ class TransformerBlock(nn.Module):
         return hidden_states
 
 
-# Stacks N_LAYERS independent transformer blocks.
-# Every layer uses the same selected attention backend.
+# Stacks the configured number of transformer blocks.
 class TransformerStack(nn.Module):
-    def __init__(self, attention_backend="manual"):
+    def __init__(self, config, attention_backend="manual"):
         super().__init__()
+
+        self.config = config
 
         self.blocks = nn.ModuleList(
             [
-                TransformerBlock(
-                    attention_backend=attention_backend
-                )
-                for _ in range(N_LAYERS)
+                TransformerBlock(config, attention_backend=attention_backend)
+                for _ in range(config.n_layers)
             ]
         )
 
     def forward(self, hidden_states, kv_cache=None, use_cache=False):
-        if kv_cache is not None and len(kv_cache) != N_LAYERS:
+        if kv_cache is not None and len(kv_cache) != self.config.n_layers:
             raise ValueError(
-                f"Expected {N_LAYERS} KV-cache entries, "
+                f"Expected {self.config.n_layers} KV-cache entries, "
                 f"received {len(kv_cache)}."
             )
 
         new_kv_cache = []
 
         for layer_index, block in enumerate(self.blocks):
-            layer_cache = (
-                kv_cache[layer_index]
-                if kv_cache is not None
-                else None
-            )
+            layer_cache = kv_cache[layer_index] if kv_cache is not None else None
 
             if use_cache:
                 hidden_states, layer_new_cache = block(
@@ -411,9 +278,7 @@ class TransformerStack(nn.Module):
                     kv_cache=layer_cache,
                     use_cache=True,
                 )
-
                 new_kv_cache.append(layer_new_cache)
-
             else:
                 hidden_states = block(hidden_states)
 
@@ -423,93 +288,68 @@ class TransformerStack(nn.Module):
         return hidden_states
 
 
-# Implements the complete decoder-only KestrelLM language model.
-# Manual attention remains the default; SDPA can be selected for benchmarking.
+# Implements the complete decoder-only KestrelLM.
+# Kestrel-M remains the default so all existing code and checkpoints stay compatible.
 class KestrelLM(nn.Module):
-    def __init__(self, attention_backend="manual"):
+    def __init__(self, attention_backend="manual", config=KESTREL_MEDIUM):
         super().__init__()
 
+        config.validate()
+
+        self.config = config
         self.attention_backend = attention_backend
 
-        self.input_embedding = InputEmbedding()
+        self.input_embedding = InputEmbedding(config)
         self.transformer = TransformerStack(
-            attention_backend=attention_backend
-        )
-        self.final_norm = RMSNorm()
-        self.lm_head = nn.Linear(
-            D_MODEL,
-            VOCAB_SIZE,
-            bias=False,
+            config,
+            attention_backend=attention_backend,
         )
 
-        # Initializes embeddings and linear layers with transformer-scale weights.
+        self.final_norm = RMSNorm(config.d_model)
+        self.lm_head = nn.Linear(config.d_model, VOCAB_SIZE, bias=False)
+
         self.apply(self.initialize_weights)
 
-        # The input token embeddings and output vocabulary projection share weights.
-        self.lm_head.weight = (
-            self.input_embedding
-            .token_embedding
-            .embedding
-            .weight
-        )
+        # Ties the input token embedding matrix to the output vocabulary projection.
+        self.lm_head.weight = self.input_embedding.token_embedding.embedding.weight
 
     # Initializes learned matrices from a small zero-centered normal distribution.
-    # Large default embedding weights would otherwise produce excessively large logits.
     def initialize_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.normal_(
-                module.weight,
-                mean=0.0,
-                std=0.02,
-            )
-
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(
-                module.weight,
-                mean=0.0,
-                std=0.02,
-            )
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    # Returns the number of tokens already stored in the KV cache.
+    # Returns the number of tokens already represented by a KV cache.
     def get_cache_length(self, kv_cache):
         if kv_cache is None:
             return 0
 
-        if len(kv_cache) != N_LAYERS:
+        if len(kv_cache) != self.config.n_layers:
             raise ValueError(
-                f"Expected {N_LAYERS} KV-cache entries, "
+                f"Expected {self.config.n_layers} KV-cache entries, "
                 f"received {len(kv_cache)}."
             )
 
-        cache_lengths = [
-            layer_cache[0].shape[-2]
-            for layer_cache in kv_cache
-        ]
+        cache_lengths = [layer_cache[0].shape[-2] for layer_cache in kv_cache]
 
         if len(set(cache_lengths)) != 1:
-            raise ValueError(
-                "All transformer layers must have "
-                "the same KV-cache length."
-            )
+            raise ValueError("All transformer layers must have the same KV-cache length.")
 
         return cache_lengths[0]
 
-    # During normal training this behaves exactly as before.
-    # During cached inference it also accepts and returns per-layer KV state.
+    # Runs normal full-sequence inference or cached autoregressive inference.
     def forward(self, token_ids, kv_cache=None, use_cache=False):
         if kv_cache is not None and not use_cache:
-            raise ValueError(
-                "kv_cache requires use_cache=True."
-            )
+            raise ValueError("kv_cache requires use_cache=True.")
 
         past_length = self.get_cache_length(kv_cache)
         sequence_length = token_ids.shape[1]
 
-        if past_length + sequence_length > CONTEXT_LENGTH:
+        if past_length + sequence_length > self.config.context_length:
             raise ValueError(
-                f"Sequence would reach position "
-                f"{past_length + sequence_length}, exceeding "
-                f"maximum context length {CONTEXT_LENGTH}."
+                f"Sequence would reach position {past_length + sequence_length}, "
+                f"exceeding maximum context length {self.config.context_length}."
             )
 
         hidden_states = self.input_embedding(
@@ -523,7 +363,6 @@ class KestrelLM(nn.Module):
                 kv_cache=kv_cache,
                 use_cache=True,
             )
-
         else:
             hidden_states = self.transformer(hidden_states)
 
@@ -538,17 +377,10 @@ class KestrelLM(nn.Module):
 
 # Computes next-token cross-entropy across every token in the batch.
 def compute_loss(logits, targets):
-    flat_logits = logits.reshape(
-        -1,
-        VOCAB_SIZE,
-    )
-
+    flat_logits = logits.reshape(-1, logits.shape[-1])
     flat_targets = targets.reshape(-1)
 
-    return F.cross_entropy(
-        flat_logits,
-        flat_targets,
-    )
+    return F.cross_entropy(flat_logits, flat_targets)
 
 
 # Returns the number of unique trainable scalar parameters in the model.
