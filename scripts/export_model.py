@@ -1,98 +1,207 @@
+import argparse
+import json
+import shutil
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
+from safetensors.torch import load_model, save_model
 
 from config import (
-    CONTEXT_LENGTH,
-    D_FF,
-    D_HEAD,
-    D_MODEL,
-    N_HEADS,
-    N_LAYERS,
+    PROJECT_ROOT,
+    TOKENIZER_PATH,
     VOCAB_SIZE,
+    ModelConfig,
 )
 from model import KestrelLM, count_parameters
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# Reads the trusted training checkpoint and desired public release stage.
+def parse_args():
+    parser = argparse.ArgumentParser()
 
-SOURCE_CHECKPOINT = PROJECT_ROOT / "checkpoints" / "final_600m.pt"
-RELEASE_DIR = PROJECT_ROOT / "release"
-OUTPUT_CHECKPOINT = RELEASE_DIR / "kestrel_30m.pt"
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        required=True,
+        help="Trusted final PyTorch training checkpoint.",
+    )
+
+    parser.add_argument(
+        "--stage",
+        choices={"base", "instruct"},
+        required=True,
+        help="Public release stage.",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional release directory override.",
+    )
+
+    return parser.parse_args()
 
 
-# Loads the final training checkpoint and verifies that its weights still match
-# the current KestrelLM architecture before creating the distributable model.
-def load_and_validate_model():
-    if not SOURCE_CHECKPOINT.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {SOURCE_CHECKPOINT}")
+# Reconstructs the exact Kestrel architecture recorded by the training run.
+def load_training_checkpoint(checkpoint_path):
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}"
+        )
 
     checkpoint = torch.load(
-        SOURCE_CHECKPOINT,
+        checkpoint_path,
         map_location="cpu",
         weights_only=False,
     )
 
-    model = KestrelLM()
-    model.load_state_dict(checkpoint["model_state_dict"])
+    if "model_config" not in checkpoint:
+        raise KeyError(
+            "Training checkpoint does not contain model_config."
+        )
+
+    model_config = ModelConfig(
+        **checkpoint["model_config"]
+    )
+
+    model = KestrelLM(
+        config=model_config
+    )
+
+    model.load_state_dict(
+        checkpoint["model_state_dict"],
+        strict=True,
+    )
+
     model.eval()
 
-    return model, checkpoint
+    return model, model_config, checkpoint
 
 
-# Creates an inference-only checkpoint containing model weights and useful
-# architecture/training metadata, but no AdamW optimizer state.
-def create_release_checkpoint(model, training_checkpoint):
-    return {
-        "model_state_dict": model.state_dict(),
-        "model_config": {
-            "vocab_size": VOCAB_SIZE,
-            "context_length": CONTEXT_LENGTH,
-            "d_model": D_MODEL,
-            "n_layers": N_LAYERS,
-            "n_heads": N_HEADS,
-            "d_head": D_HEAD,
-            "d_ff": D_FF,
-        },
+# Writes architecture and training provenance separately from tensor weights.
+def create_release_config(
+    model,
+    model_config,
+    checkpoint,
+    stage,
+):
+    release_config = {
+        "model_type": "kestrel",
+        "stage": stage,
+        "vocab_size": VOCAB_SIZE,
         "parameter_count": count_parameters(model),
-        "training": {
-            "global_step": training_checkpoint["global_step"],
-            "tokens_processed": training_checkpoint["tokens_processed"],
-            "dataset": "TinyStories",
-        },
-        "evaluation": {
-            "validation_tokens": 4_690_944,
-            "validation_loss": 1.5031,
-            "validation_perplexity": 4.4957,
-        },
+        "tie_word_embeddings": True,
+        **asdict(model_config),
     }
 
+    if "global_step" in checkpoint:
+        release_config["global_step"] = checkpoint["global_step"]
 
-# Exports the trained model into a smaller checkpoint intended for inference
-# and public distribution.
+    if "tokens_processed" in checkpoint:
+        release_config["tokens_processed"] = checkpoint["tokens_processed"]
+
+    return release_config
+
+
+# Reloads the SafeTensors file into a fresh model to verify the public artifact.
+def validate_safetensors(weights_path, model_config):
+    validation_model = KestrelLM(
+        config=model_config
+    )
+
+    load_model(
+        validation_model,
+        str(weights_path),
+        strict=True,
+        device="cpu",
+    )
+
+    validation_model.eval()
+
+
+# Exports inference-only weights, JSON configuration, and tokenizer.
 def main():
-    model, training_checkpoint = load_and_validate_model()
+    args = parse_args()
 
-    release_checkpoint = create_release_checkpoint(
+    output_dir = args.output_dir
+
+    if output_dir is None:
+        output_dir = (
+            PROJECT_ROOT
+            / "release"
+            / f"kestrel-{args.stage}"
+        )
+
+    weights_path = output_dir / "model.safetensors"
+    config_path = output_dir / "config.json"
+    tokenizer_output_path = output_dir / "tokenizer.json"
+
+    model, model_config, checkpoint = load_training_checkpoint(
+        args.checkpoint
+    )
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # save_model handles KestrelLM's tied embedding/LM-head storage correctly.
+    save_model(
         model,
-        training_checkpoint,
+        str(weights_path),
+        metadata={
+            "format": "pt",
+            "model_type": "kestrel",
+            "stage": args.stage,
+        },
     )
 
-    RELEASE_DIR.mkdir(parents=True, exist_ok=True)
-
-    torch.save(
-        release_checkpoint,
-        OUTPUT_CHECKPOINT,
+    release_config = create_release_config(
+        model,
+        model_config,
+        checkpoint,
+        args.stage,
     )
 
-    size_mb = OUTPUT_CHECKPOINT.stat().st_size / 1024**2
+    config_path.write_text(
+        json.dumps(
+            release_config,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
-    print(f"Source checkpoint: {SOURCE_CHECKPOINT}")
-    print(f"Release checkpoint: {OUTPUT_CHECKPOINT}")
+    if not TOKENIZER_PATH.exists():
+        raise FileNotFoundError(
+            f"Tokenizer not found: {TOKENIZER_PATH}"
+        )
+
+    shutil.copy2(
+        TOKENIZER_PATH,
+        tokenizer_output_path,
+    )
+
+    validate_safetensors(
+        weights_path,
+        model_config,
+    )
+
+    size_mb = (
+        weights_path.stat().st_size
+        / 1024**2
+    )
+
+    print(f"Source checkpoint: {args.checkpoint}")
+    print(f"Stage: {args.stage}")
     print(f"Parameters: {count_parameters(model):,}")
-    print(f"Training step: {training_checkpoint['global_step']:,}")
-    print(f"Training tokens: {training_checkpoint['tokens_processed']:,}")
-    print(f"Release size: {size_mb:.1f} MiB")
+    print(f"Weights: {weights_path}")
+    print(f"Config: {config_path}")
+    print(f"Tokenizer: {tokenizer_output_path}")
+    print(f"SafeTensors size: {size_mb:.1f} MiB")
+    print("SafeTensors reload validation: PASSED")
     print("Model export: PASSED")
 
 

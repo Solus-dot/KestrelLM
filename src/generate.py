@@ -13,7 +13,7 @@ HF_REPO_ID = "SolusBolus/KestrelLM"
 HF_MODEL_FILENAME = "kestrel_30m.pt"
 
 LOCAL_RELEASE_CHECKPOINT = PROJECT_ROOT / "release" / HF_MODEL_FILENAME
-LOCAL_TRAINING_CHECKPOINT = CHECKPOINT_DIR / "final_600m.pt"
+LOCAL_TRAINING_CHECKPOINT = CHECKPOINT_DIR / "final.pt"
 
 
 # Chooses an AMD/NVIDIA GPU first, Apple MPS second, and CPU otherwise.

@@ -1,3 +1,5 @@
+from itertools import islice
+
 from datasets import load_dataset
 from tokenizers import Tokenizer
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
@@ -14,34 +16,82 @@ from config import (
 )
 
 
-DATASET_NAME = "roneneldan/TinyStories"
-DATASET_SPLIT = "train"
+# Representative 70/20/10 sample of the final pretraining mixture.
+TOKENIZER_DOCUMENTS = 100_000
+
+FINEWEB_DOCUMENTS = 70_000
+COSMOPEDIA_DOCUMENTS = 20_000
+FINEWIKI_DOCUMENTS = 10_000
+
+SHUFFLE_BUFFER_SIZE = 10_000
+SHUFFLE_SEED = 42
 
 
-# Loads the TinyStories training split.
-# Each row contains one story in its "text" field.
-def load_training_dataset():
-    print(f"Loading {DATASET_NAME}...")
+# Opens one Hugging Face dataset as a shuffled streaming dataset.
+# Streaming prevents the tokenizer-training step from downloading the full corpus.
+def load_stream(dataset_name, dataset_config):
+    print(f"Opening {dataset_name} [{dataset_config}]...")
 
     dataset = load_dataset(
-        DATASET_NAME,
-        split=DATASET_SPLIT,
+        dataset_name,
+        dataset_config,
+        split="train",
+        streaming=True,
     )
 
-    print(f"Loaded {len(dataset):,} stories.")
+    return dataset.shuffle(
+        seed=SHUFFLE_SEED,
+        buffer_size=SHUFFLE_BUFFER_SIZE,
+    )
 
-    return dataset
 
+# Yields up to document_count non-empty text documents from one dataset stream.
+def text_iterator(dataset, document_count):
+    documents_yielded = 0
 
-# Yields one story at a time to the tokenizer trainer.
-# This avoids creating another large list containing every story.
-def story_iterator(dataset):
     for example in dataset:
-        yield example["text"]
+        text = example["text"]
+
+        if not text or not text.strip():
+            continue
+
+        yield text
+
+        documents_yielded += 1
+
+        if documents_yielded >= document_count:
+            break
+
+
+# Produces the representative 70/20/10 tokenizer-training corpus.
+def training_text_iterator():
+    fineweb = load_stream(
+        "HuggingFaceTB/smollm-corpus",
+        "fineweb-edu-dedup",
+    )
+
+    cosmopedia = load_stream(
+        "HuggingFaceTB/smollm-corpus",
+        "cosmopedia-v2",
+    )
+
+    finewiki = load_stream(
+        "HuggingFaceFW/finewiki",
+        "en",
+    )
+
+    print(f"FineWeb-Edu-Dedup documents: {FINEWEB_DOCUMENTS:,}")
+    yield from text_iterator(fineweb, FINEWEB_DOCUMENTS)
+
+    print(f"Cosmopedia v2 documents: {COSMOPEDIA_DOCUMENTS:,}")
+    yield from text_iterator(cosmopedia, COSMOPEDIA_DOCUMENTS)
+
+    print(f"FineWiki documents: {FINEWIKI_DOCUMENTS:,}")
+    yield from text_iterator(finewiki, FINEWIKI_DOCUMENTS)
 
 
 # Creates an empty byte-level BPE tokenizer.
-# The vocabulary and merge rules are learned later from TinyStories.
+# Byte-level tokenization guarantees coverage for arbitrary input text.
 def create_tokenizer():
     tokenizer = Tokenizer(
         BPE(
@@ -49,19 +99,16 @@ def create_tokenizer():
         )
     )
 
-    # Byte-level preprocessing gives the tokenizer coverage over raw bytes.
     tokenizer.pre_tokenizer = ByteLevel(
         add_prefix_space=False,
     )
 
-    # Converts byte-level representations back into normal text.
     tokenizer.decoder = ByteLevelDecoder()
 
     return tokenizer
 
 
-# Configures how the BPE vocabulary is learned.
-# The trainer learns up to VOCAB_SIZE tokens and preserves our special tokens.
+# Configures vocabulary learning and reserves the model's control tokens.
 def create_trainer():
     return BpeTrainer(
         vocab_size=VOCAB_SIZE,
@@ -71,23 +118,18 @@ def create_trainer():
     )
 
 
-# Trains the tokenizer on TinyStories.
-# Saves the complete trained tokenizer to tokenizer/tokenizer.json.
+# Trains the general-domain KestrelLM tokenizer and saves tokenizer.json.
 def train_tokenizer():
-    dataset = load_training_dataset()
-
     tokenizer = create_tokenizer()
     trainer = create_trainer()
 
-    print(
-        f"Training BPE tokenizer with target "
-        f"vocabulary size {VOCAB_SIZE:,}..."
-    )
+    print(f"Training on {TOKENIZER_DOCUMENTS:,} streamed documents.")
+    print(f"Target vocabulary size: {VOCAB_SIZE:,}\n")
 
     tokenizer.train_from_iterator(
-        story_iterator(dataset),
+        training_text_iterator(),
         trainer=trainer,
-        length=len(dataset),
+        length=TOKENIZER_DOCUMENTS,
     )
 
     TOKENIZER_DIR.mkdir(
@@ -95,9 +137,7 @@ def train_tokenizer():
         exist_ok=True,
     )
 
-    tokenizer.save(
-        str(TOKENIZER_PATH)
-    )
+    tokenizer.save(str(TOKENIZER_PATH))
 
     print()
     print("Tokenizer training complete.")

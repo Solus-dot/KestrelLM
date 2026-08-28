@@ -9,7 +9,6 @@ TOKENIZER_DIR = PROJECT_ROOT / "tokenizer"
 TOKENIZER_PATH = TOKENIZER_DIR / "tokenizer.json"
 
 DATA_DIR = PROJECT_ROOT / "data"
-TINYSTORIES_DIR = DATA_DIR / "tinystories"
 HF_CACHE_DIR = DATA_DIR / "hf_cache"
 TOKENIZED_DATA_DIR = DATA_DIR / "tokenized"
 
@@ -28,7 +27,19 @@ UNK_TOKEN = "<unk>"
 BOS_TOKEN = "<bos>"
 EOS_TOKEN = "<eos>"
 
-SPECIAL_TOKENS = [PAD_TOKEN, UNK_TOKEN, BOS_TOKEN, EOS_TOKEN]
+SYSTEM_TOKEN = "<|system|>"
+USER_TOKEN = "<|user|>"
+ASSISTANT_TOKEN = "<|assistant|>"
+
+SPECIAL_TOKENS = [
+    PAD_TOKEN,
+    UNK_TOKEN,
+    BOS_TOKEN,
+    EOS_TOKEN,
+    SYSTEM_TOKEN,
+    USER_TOKEN,
+    ASSISTANT_TOKEN,
+]
 
 
 # Stores the architectural dimensions for one KestrelLM model size.
@@ -92,7 +103,6 @@ for model_config in MODEL_CONFIGS:
 
 
 # Kestrel-M remains the default architecture.
-# These aliases keep all existing code and checkpoints compatible.
 ACTIVE_MODEL_CONFIG = KESTREL_MEDIUM
 
 CONTEXT_LENGTH = ACTIVE_MODEL_CONFIG.context_length
@@ -117,7 +127,6 @@ WEIGHT_DECAY = 0.1
 
 MAX_GRAD_NORM = 1.0
 
-# Approximately 600M total training tokens.
 TRAINING_STEPS = 36_622
 RUN_UNTIL_STEP = 36_622
 

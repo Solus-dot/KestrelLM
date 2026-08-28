@@ -4,7 +4,7 @@ from config import CHECKPOINT_DIR, VOCAB_SIZE
 from model import KestrelLM
 
 
-FINAL_CHECKPOINT = CHECKPOINT_DIR / "final_600m.pt"
+FINAL_CHECKPOINT = CHECKPOINT_DIR / "final.pt"
 
 SEQUENCE_LENGTH = 32
 PREFILL_LENGTH = 8
