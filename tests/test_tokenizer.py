@@ -20,7 +20,7 @@ def load_tokenizer():
     if not TOKENIZER_PATH.exists():
         raise FileNotFoundError(
             f"Tokenizer not found at {TOKENIZER_PATH}.\n"
-            "Run: uv run python src/train_tokenizer.py"
+            "Run: uv run python scripts/train_tokenizer.py"
         )
 
     return Tokenizer.from_file(
