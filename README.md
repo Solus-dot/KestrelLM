@@ -1,12 +1,190 @@
 # KestrelLM
 
-KestrelLM is a decoder-only Transformer language model built from scratch in PyTorch. The project covers the complete language-model pipeline: custom BPE tokenization, binary dataset preprocessing, causal Transformer implementation, pretraining, checkpointing, evaluation, autoregressive generation, KV-cached inference, performance benchmarking, and controlled scaling experiments.
+KestrelLM is a small decoder-only Transformer language model implemented from scratch in PyTorch. The project covers the full language-model lifecycle rather than only the model architecture: custom ByteLevel BPE tokenization, streamed corpus construction, binary token packing, causal pretraining, checkpointing, evaluation, autoregressive generation, KV-cached inference, controlled systems experiments, supervised instruction tuning, and SafeTensors release.
 
-The primary released model, **Kestrel-M**, contains **29.6M parameters** and was pretrained on **600M TinyStories tokens**, reaching a full-validation perplexity of **4.50**. Pretrained weights are published on Hugging Face as `SolusBolus/KestrelLM`, and generation automatically downloads the checkpoint when no local copy is available.
+The current target is **Kestrel-L**, a 63.3M-parameter model that will be pretrained from scratch on approximately **1.2B general-domain tokens** and then post-trained into **Kestrel-Instruct**. An earlier 29.6M TinyStories model remains useful as a historical baseline, but TinyStories is no longer part of the active training pipeline.
 
-## Results
+```text
+general-domain corpus → custom BPE tokenizer → packed train/validation streams → Kestrel-L pretraining → Kestrel-Base → supervised instruction tuning → Kestrel-Instruct → SafeTensors release
+```
 
-| Metric | Kestrel-M |
+## Current model family
+
+All Kestrel variants use six decoder blocks, a 512-token context, 64-dimensional attention heads, RMSNorm, SwiGLU, learned positional embeddings, causal multi-head self-attention, and tied token-embedding / language-model-head weights. Width is the primary scaling dimension.
+
+| Model | Parameters | d_model | Heads | d_head | d_ff |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Kestrel-S | 8,523,008 | 256 | 4 | 64 | 1,024 |
+| Kestrel-M | 29,628,928 | 512 | 8 | 64 | 2,048 |
+| Kestrel-L | 63,317,760 | 768 | 12 | 64 | 3,072 |
+
+The forward path is:
+
+```text
+token IDs → token + learned positional embeddings → 6 × [RMSNorm → causal attention → residual → RMSNorm → SwiGLU → residual] → final RMSNorm → tied LM head → logits
+```
+
+Each block applies pre-normalized attention followed by a pre-normalized SwiGLU feed-forward network:
+
+\[
+H' = H + \mathrm{Attention}(\mathrm{RMSNorm}(H))
+\]
+
+\[
+H'' = H' + \mathrm{SwiGLU}(\mathrm{RMSNorm}(H'))
+\]
+
+with
+
+\[
+\mathrm{SwiGLU}(H)=\left(\mathrm{SiLU}(HW_g)\odot HW_u\right)W_d.
+\]
+
+The reference attention implementation is handwritten in PyTorch rather than delegated to `nn.Transformer`. It performs explicit Q/K/V projections, head splitting, scaled \(QK^\top\), causal masking, softmax, value mixing, head recombination, and output projection. PyTorch SDPA is also available as an optional experimental backend.
+
+## General-domain tokenizer and corpus
+
+The active tokenizer is a custom **8,192-token ByteLevel BPE** trained from scratch on a representative sample of the new pretraining distribution. The tokenizer-training sample contains 100,000 streamed documents: 70,000 FineWeb-Edu-Dedup documents, 20,000 Cosmopedia v2 documents, and 10,000 FineWiki English documents.
+
+The reserved vocabulary contains:
+
+```text
+<pad>  <unk>  <bos>  <eos>  <|system|>  <|user|>  <|assistant|>
+```
+
+The chat-role tokens are reserved before base pretraining so the same vocabulary and embedding matrix can later be reused during supervised instruction tuning.
+
+The finalized pretraining mixture is measured after tokenization:
+
+| Source | Share | Exact training tokens |
+| --- | ---: | ---: |
+| FineWeb-Edu-Dedup | 70% | 839,997,850 |
+| Cosmopedia v2 | 20% | 239,999,386 |
+| FineWiki English | 10% | 119,999,692 |
+| **Total** | **100%** | **1,199,996,928** |
+
+The source datasets are streamed rather than downloaded in full. Documents are deterministically shuffled, tokenized with the frozen Kestrel tokenizer, terminated with `<eos>`, and written until the source reaches its exact Kestrel-token quota.
+
+```text
+FineWeb-Edu-Dedup + Cosmopedia v2 + FineWiki → streamed documents → Kestrel BPE → <eos> boundaries → uint16 token stream
+```
+
+The resulting local files are `data/tokenized/train.bin` and `data/tokenized/validation.bin`. Token IDs are stored as `uint16` because the vocabulary is far below 65,536 entries. `BinaryTokenDataset` memory-maps these files and returns fixed-length next-token-prediction examples, so the core training code is independent of the original source corpus.
+
+## Pretraining target
+
+The main Kestrel-L run is designed around a fixed batch and exact token budget:
+
+| Setting | Value |
+| --- | ---: |
+| Physical batch size | 32 |
+| Context length | 512 |
+| Gradient accumulation | 1 |
+| Effective batch size | 32 |
+| Tokens per optimizer step | 16,384 |
+| Optimizer steps | 73,242 |
+| Total training tokens | 1,199,996,928 |
+| Optimizer | AdamW |
+| Peak learning rate | \(1\times10^{-4}\) |
+| Minimum learning rate | \(1\times10^{-5}\) |
+| Warmup | 500 steps |
+| Schedule | Linear warmup + cosine decay |
+| Adam β₁ / β₂ | 0.9 / 0.95 |
+| Weight decay | 0.1 |
+| Gradient clipping | 1.0 |
+
+The exact training budget is
+
+\[
+73{,}242 \times 32 \times 512 = 1{,}199{,}996{,}928.
+\]
+
+Training checkpoints remain trusted local `.pt` files because they contain model weights, optimizer state, counters, processed-token totals, and model configuration required for exact resume. Public inference artifacts are exported separately as SafeTensors.
+
+## Hardware scaling benchmark
+
+Training throughput and peak allocated VRAM were measured on an **AMD Radeon RX 7900 XTX** through ROCm at batch size 32 and context length 512.
+
+| Model | Seconds/step | Throughput | Peak VRAM |
+| --- | ---: | ---: | ---: |
+| Kestrel-S | 0.091 | 180,876 tok/s | 5.39 GB |
+| Kestrel-M | 0.227 | 72,049 tok/s | 8.86 GB |
+| Kestrel-L | 0.402 | 40,800 tok/s | 12.48 GB |
+
+All three variants fit at the same physical batch size. Keeping the batch fixed makes scaling comparisons cleaner because every optimizer update contains the same 16,384 tokens. At the measured Kestrel-L throughput, 1.2B tokens correspond to roughly 8.2 hours of pure training compute before validation and checkpoint overhead.
+
+## KV-cached inference
+
+KestrelLM supports autoregressive generation with dynamic per-layer KV caches. After prompt prefill, each decoding step computes projections only for the newly generated token while reusing previous keys and values.
+
+```text
+prompt prefill → cached K/V + next-token logits → generate one token → append new K/V → repeat
+```
+
+For the earlier Kestrel-M model with a 32-token prompt and 400 generated tokens:
+
+| Method | Throughput | Latency |
+| --- | ---: | ---: |
+| Full-context recomputation | 308.37 tok/s | 3.243 ms/token |
+| Dynamic KV cache | **456.50 tok/s** | **2.191 ms/token** |
+
+Dynamic KV caching therefore produced a **1.48× speedup** and **32.4% lower token latency**.
+
+A fixed-capacity preallocated KV cache was also implemented and verified, but it measured **421.84 tok/s** at the same 400-token horizon, approximately 8% slower than the dynamic implementation. The dynamic cache was therefore retained.
+
+## Manual attention vs SDPA
+
+PyTorch scaled dot-product attention was added as an interchangeable backend and numerically compared against the handwritten implementation. Full-sequence and cached-logit parity passed with maximum differences on the order of \(10^{-5}\).
+
+| Sequence length | Manual | SDPA | SDPA / Manual |
+| ---: | ---: | ---: | ---: |
+| 32 | 13,485 tok/s | 13,972 tok/s | 1.04× |
+| 128 | 41,156 tok/s | 44,021 tok/s | 1.07× |
+| 256 | 83,960 tok/s | 85,026 tok/s | 1.01× |
+| 512 | **106,145 tok/s** | 98,545 tok/s | 0.93× |
+
+For 400-token cached decoding, manual attention reached **479.73 tok/s** while SDPA reached **464.96 tok/s**. Manual attention therefore remains the default for the measured ROCm workload, with SDPA retained as an optional comparison backend.
+
+## Post-training plan
+
+After general-domain base pretraining, Kestrel-Base will be supervised-fine-tuned into Kestrel-Instruct. The first baseline will use **full-parameter SFT** rather than LoRA because the 63.3M-parameter model fits comfortably on the available GPU. PEFT can later be evaluated as a controlled memory/throughput experiment rather than being required for feasibility.
+
+A conversation is serialized using the reserved role tokens:
+
+```text
+<|system|> system message <|user|> user request <|assistant|> assistant response <eos>
+```
+
+The entire conversation is visible to the model, but loss is applied only to assistant-response targets. System/user/control positions use `-100` labels so PyTorch cross entropy ignores them.
+
+```text
+system/user tokens: no supervised loss → assistant tokens: supervised next-token loss → full-parameter update
+```
+
+The exact SFT corpus will be selected separately with attention to quality, licensing, breadth, and evaluation contamination.
+
+## SafeTensors release standard
+
+Training state and public inference state are deliberately separated:
+
+```text
+trusted resumable training checkpoint = .pt   |   public inference weights = .safetensors
+```
+
+The intended release layout is:
+
+```text
+release/kestrel-base/     → model.safetensors | config.json | tokenizer.json
+release/kestrel-instruct/ → model.safetensors | config.json | tokenizer.json
+```
+
+Because KestrelLM ties the input embedding and LM-head weights, export uses the model-aware SafeTensors save/load helpers so shared tensor storage is represented correctly. A release is validated by loading the SafeTensors weights into a fresh model with the exact recorded architecture before publication.
+
+## Legacy TinyStories baseline
+
+The original Kestrel-M model was trained on TinyStories as an implementation proof before the project moved to general-domain pretraining. That historical run remains useful for comparison but is not part of the active corpus pipeline.
+
+| Metric | Legacy Kestrel-M |
 | --- | ---: |
 | Parameters | 29,628,928 |
 | Training tokens | 600,014,848 |
@@ -14,346 +192,46 @@ The primary released model, **Kestrel-M**, contains **29.6M parameters** and was
 | Final training loss | 1.5309 |
 | Validation tokens | 4,690,944 |
 | Validation loss | 1.5031 |
-| Validation perplexity | **4.4957** |
-| Context length | 512 |
-| Vocabulary size | 8,192 |
-
-The validation metrics were measured over the complete held-out validation token stream. Training on an AMD Radeon RX 7900 XTX using ROCm reached approximately **72K tokens/s**; the final portion of the run, from roughly 160M to 600M tokens, completed in about **1 hour 37 minutes**.
-
-For autoregressive inference with a 32-token prompt and 400 generated tokens, KV caching increased throughput from **308.37 to 456.50 tokens/s**, a **1.48× speedup**, while reducing latency from 3.243 to 2.191 ms/token.
-
-## Architecture
-
-KestrelLM uses a pre-normalized decoder-only Transformer. The released Kestrel-M configuration is:
-
-| Component | Configuration |
-| --- | --- |
-| Transformer layers | 6 |
-| Model dimension | 512 |
-| Attention heads | 8 |
-| Head dimension | 64 |
-| Feed-forward dimension | 2,048 |
-| Context length | 512 |
-| Vocabulary size | 8,192 |
-| Normalization | RMSNorm |
-| Feed-forward network | SwiGLU |
-| Positional representation | Learned positional embeddings |
-| Attention | Multi-head causal self-attention |
-| Output head | Tied to token embeddings |
-
-The model flow is `token IDs → token + positional embeddings → 6 Transformer blocks → final RMSNorm → tied LM head → logits`.
-
-Each Transformer block applies pre-normalized attention followed by a pre-normalized feed-forward network:
-
-$$
-H' = H + \mathrm{Attention}(\mathrm{RMSNorm}(H))
-$$
-
-$$
-H'' = H' + \mathrm{SwiGLU}(\mathrm{RMSNorm}(H'))
-$$
-
-The SwiGLU feed-forward network is:
-
-$$
-\mathrm{SwiGLU}(H) = \left(\mathrm{SiLU}(HW_g) \odot HW_u\right)W_d
-$$
-
-The primary attention implementation is written directly in PyTorch rather than using `nn.Transformer`. Its computation is `H → Q/K/V projections → split heads → scaled QKᵀ scores → causal mask → softmax → weighted values → combine heads → output projection`.
-
-For one attention head:
-
-$$
-\mathrm{Attention}(Q,K,V)
-=
-\mathrm{softmax}
-\left(
-\frac{QK^\top}{\sqrt{d_h}} + M
-\right)V
-$$
-
-where $M$ is the causal mask. PyTorch scaled dot-product attention is also available as an optional backend for comparison with the handwritten implementation.
-
-## Tokenizer and Dataset
-
-KestrelLM is trained on **TinyStories** using a custom Byte-Level BPE tokenizer built with Hugging Face `tokenizers`. The vocabulary contains 8,192 tokens with the special tokens `<pad>`, `<unk>`, `<bos>`, and `<eos>`.
-
-Every story is terminated with `<eos>` before the tokenized stories are packed into continuous streams. The resulting training and validation data are stored as `uint16` binary files and accessed through NumPy memory mapping.
-
-Training samples are contiguous windows of $T+1$ tokens. Given
-
-$$
-[x_1,x_2,\ldots,x_T,x_{T+1}],
-$$
-
-the model receives
-
-$$
-X=[x_1,\ldots,x_T]
-$$
-
-and predicts
-
-$$
-Y=[x_2,\ldots,x_{T+1}].
-$$
-
-Training therefore uses standard autoregressive next-token prediction with token-level cross-entropy:
-
-$$
-\mathcal{L}
-=
--\frac{1}{N}
-\sum_{i=1}^{N}
-\log p(y_i)
-$$
-
-## Training
-
-The released 29.6M-parameter model used the following configuration:
-
-| Setting | Value |
-| --- | ---: |
-| Optimizer | AdamW |
-| Peak learning rate | $1\times10^{-4}$ |
-| Minimum learning rate | $1\times10^{-5}$ |
-| Warmup | 500 steps |
-| LR schedule | Linear warmup + cosine decay |
-| Adam β₁ | 0.9 |
-| Adam β₂ | 0.95 |
-| Weight decay | 0.1 |
-| Gradient clipping | 1.0 |
-| Physical batch size | 32 |
-| Gradient accumulation | 1 |
-| Effective batch size | 32 |
-| Context length | 512 |
-| Tokens per optimizer step | 16,384 |
-| Optimizer steps | 36,622 |
-| Total training tokens | 600,014,848 |
-
-Parameters with two or more dimensions receive AdamW weight decay, while one-dimensional parameters such as RMSNorm scales are excluded.
-
-Pretraining began on Apple MPS and was later migrated to an AMD Radeon RX 7900 XTX using ROCm without restarting the run. Training checkpoints store the model parameters, AdamW optimizer state, optimizer step, data-pass counter, processed-token count, and model configuration. Checkpoints are loaded onto CPU before model and optimizer tensors are moved to the active accelerator, making them portable between MPS, ROCm, CUDA, and CPU.
-
-Checkpoint writes are atomic: the new state is first written to a temporary file and then replaces the rolling checkpoint.
-
-## Scaling Study
-
-To measure the effect of model capacity under a fixed data budget, KestrelLM was width-scaled into three configurations. All models use 6 Transformer layers, 512-token context, 64-dimensional attention heads, a 4× feed-forward expansion, the same 8,192-token tokenizer, the same TinyStories data, AdamW, batch size 32, and exactly **100,007,936 training tokens**. Only model width changes.
-
-| Model | Parameters | d_model | Heads | d_ff | Validation loss | Perplexity |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Kestrel-S | 8,523,008 | 256 | 4 | 1,024 | 2.4405 | 11.4790 |
-| Kestrel-M | 29,628,928 | 512 | 8 | 2,048 | 2.0780 | 7.9883 |
-| Kestrel-L | 63,317,760 | 768 | 12 | 3,072 | **1.9178** | **6.8060** |
-
-![KestrelLM width scaling](assets/scaling.png)
-
-Increasing width consistently improved held-out performance at the same training-token budget. From Kestrel-S to Kestrel-L, parameter count increased by **7.43×** while perplexity fell from **11.4790 to 6.8060**, a reduction of approximately **40.7%**. The gain from S → M was larger than the gain from M → L, showing diminishing returns as model capacity increased.
-
-The compute cost increased accordingly:
-
-| Model | Training throughput | Peak VRAM |
-| --- | ---: | ---: |
-| Kestrel-S | 181,232 tokens/s | 5.39 GB |
-| Kestrel-M | 72,206 tokens/s | 8.86 GB |
-| Kestrel-L | 40,779 tokens/s | 12.48 GB |
-
-The experiment therefore measures a direct quality-compute tradeoff: larger models achieved lower validation loss at the same data budget but required more time and accelerator memory.
-
-The same Kestrel-M architecture also provides a controlled comparison along the training-data axis:
-
-| Training tokens | Validation loss | Perplexity |
-| ---: | ---: | ---: |
-| 100,007,936 | 2.0780 | 7.9883 |
-| 600,014,848 | **1.5031** | **4.4957** |
-
-Together, the experiments show `more parameters at fixed tokens → better validation performance` and `more tokens at fixed parameters → better validation performance`.
-
-## KV-Cached Inference
-
-Naive autoregressive generation repeatedly recomputes the entire visible sequence: `process prompt → generate token → process the enlarged sequence again → generate token → repeat`.
-
-KestrelLM instead stores previously computed keys and values for every attention layer:
-
-$$
-K_{\mathrm{cache}}=[K_{\mathrm{past}};K_{\mathrm{new}}]
-$$
-
-$$
-V_{\mathrm{cache}}=[V_{\mathrm{past}};V_{\mathrm{new}}]
-$$
-
-After prompt prefill, each decoding step only computes projections for the newly generated token. Once the learned 512-position context is full, the cache is rebuilt from the newest context window.
-
-Cached and uncached inference were verified numerically with a maximum logit difference of **0.00002861**, and greedy generation produced identical token sequences.
-
-For a 32-token prompt followed by 400 generated tokens:
-
-| Method | Throughput | Latency | Peak memory |
-| --- | ---: | ---: | ---: |
-| Full-context recomputation | 308.37 tokens/s | 3.243 ms/token | 0.180 GB |
-| KV cache | **456.50 tokens/s** | **2.191 ms/token** | 0.161 GB |
-
-The cache therefore produced a **1.48× speedup** and **32.4% latency reduction**. Its benefit grows with decode length because uncached generation repeatedly processes an increasingly long prefix.
-
-## Optimization Experiments
-
-Two additional inference optimizations were implemented and measured rather than assumed to be beneficial.
-
-### Dynamic vs Preallocated KV Cache
-
-The normal cache grows key/value tensors using `torch.cat`. A fixed-capacity preallocated implementation was also built and verified to reuse the same underlying tensor storage.
-
-| Implementation | Throughput | Latency |
-| --- | ---: | ---: |
-| Dynamic cache | **456.50 tokens/s** | **2.191 ms/token** |
-| Preallocated cache | 421.84 tokens/s | 2.371 ms/token |
-
-At a 400-token decode horizon, preallocation was approximately **8% slower** despite slightly reducing peak memory. The dynamic implementation was therefore retained.
-
-### Manual Attention vs PyTorch SDPA
-
-PyTorch scaled dot-product attention was added as an interchangeable backend and numerically compared with the handwritten implementation. Maximum differences remained on the order of $10^{-5}$, and full/cached parity tests passed.
-
-| Sequence length | Manual attention | SDPA | SDPA / Manual |
-| ---: | ---: | ---: | ---: |
-| 32 | 13,485 tokens/s | 13,972 tokens/s | 1.04× |
-| 128 | 41,156 tokens/s | 44,021 tokens/s | 1.07× |
-| 256 | 83,960 tokens/s | 85,026 tokens/s | 1.01× |
-| 512 | **106,145 tokens/s** | 98,545 tokens/s | 0.93× |
-
-For 400-token KV-cached generation, manual attention reached **479.73 tokens/s at 2.084 ms/token**, while SDPA reached **464.96 tokens/s at 2.151 ms/token**. Manual attention therefore remains the default for this model and ROCm workload.
-
-These experiments intentionally preserve negative results: an implementation change is retained only when measurement shows an advantage for the target workload.
-
-## Generation
-
-Generation supports greedy decoding, temperature sampling, top-k filtering, top-p/nucleus sampling, deterministic seeds, `<eos>` termination, and KV-cached decoding.
-
-Install the project and generate text with:
-
-```bash
-git clone git@github.com:Solus-dot/KestrelLM.git
-cd KestrelLM
-uv sync
-
-uv run python src/generate.py \
-    --prompt "Once upon a time" \
-    --max-new-tokens 200 \
-    --temperature 0.8 \
-    --top-k 50 \
-    --top-p 0.95
+| Validation perplexity | 4.4957 |
+
+The legacy model demonstrated that the architecture, training loop, checkpointing, evaluation, generation, and KV cache worked end to end. The current general-domain Kestrel-L run supersedes it as the primary model-development path.
+
+## Repository structure
+
+```text
+src/
+  config.py
+  dataset.py
+  dataloader.py
+  model.py
+  train.py
+  generate.py
+
+scripts/
+  train_tokenizer.py
+  preprocess_data.py
+  evaluate.py
+  export_model.py
+
+benchmarks/
+  training.py
+  inference.py
+  attention.py
+
+tests/
+  test_tokenizer.py
+  test_kv_cache.py
+  test_attention_backends.py
 ```
 
-If neither `release/kestrel_30m.pt` nor `checkpoints/final.pt` exists locally, the generator automatically downloads `kestrel_30m.pt` from `SolusBolus/KestrelLM` through `huggingface_hub`.
+The core `src/` directory is intentionally small. Corpus acquisition and preprocessing live in `scripts/`; performance experiments live in `benchmarks/`; correctness checks live in `tests/`.
 
-An example TinyStories-style generation begins:
+## Environment
 
-> Once upon a time, there was a big, big lion. He lived in a jungle with his friends. One day, he saw a little bird with a hurt wing...
+KestrelLM uses Python 3.12+ and `uv`. Standard PyTorch device interfaces are used for NVIDIA CUDA, AMD ROCm through `torch.cuda`, Apple MPS, and CPU.
 
-KestrelLM is trained only on TinyStories and is intended as a small language-model implementation and systems project rather than a general-purpose assistant.
+On systems where ROCm PyTorch is installed manually into the project environment, use `uv run --no-sync ...` for execution so dependency synchronization does not replace the ROCm build with a portable/CPU PyTorch wheel.
 
-## Reproducing Training
+## Current status
 
-KestrelLM requires Python 3.12+ and uses `uv`.
-
-Prepare the dataset and tokenizer:
-
-```bash
-PYTHONPATH=src uv run python scripts/download_dataset.py
-PYTHONPATH=src uv run python scripts/train_tokenizer.py
-PYTHONPATH=src uv run python scripts/preprocess_data.py
-```
-
-Train the standard Kestrel-M configuration:
-
-```bash
-uv run python src/train.py --model medium --steps 36622
-```
-
-The available sizes are `small = Kestrel-S (8.52M)`, `medium = Kestrel-M (29.63M)`, and `large = Kestrel-L (63.32M)`.
-
-A named experiment receives its own checkpoint directory:
-
-```bash
-uv run python src/train.py \
-    --model large \
-    --steps 6104 \
-    --run-name scaling/kestrel_l
-```
-
-Passing `--resume` continues from that run's `latest.pt`.
-
-The scaling study uses 6,104 steps per model:
-
-$$
-6104 \times 32 \times 512 = 100,007,936
-$$
-
-```bash
-uv run python src/train.py --model small  --steps 6104 --run-name scaling/kestrel_s
-uv run python src/train.py --model medium --steps 6104 --run-name scaling/kestrel_m
-uv run python src/train.py --model large  --steps 6104 --run-name scaling/kestrel_l
-```
-
-## Evaluation, Tests, and Benchmarks
-
-Evaluate any trained checkpoint over the complete validation stream with:
-
-```bash
-PYTHONPATH=src uv run python scripts/evaluate.py \
-    --checkpoint checkpoints/final.pt
-```
-
-The full evaluation requires `data/tokenized/validation.bin`.
-
-Correctness tests are run with:
-
-```bash
-PYTHONPATH=src uv run python tests/test_tokenizer.py
-PYTHONPATH=src uv run python tests/test_kv_cache.py
-PYTHONPATH=src uv run python tests/test_attention_backends.py
-```
-
-Performance experiments are run with:
-
-```bash
-PYTHONPATH=src uv run python benchmarks/training.py
-PYTHONPATH=src uv run python benchmarks/inference.py
-PYTHONPATH=src uv run python benchmarks/attention.py
-```
-
-The training benchmark measures model-size throughput and VRAM; the inference benchmark measures prompt processing, full-context generation, and KV-cached generation; the attention benchmark compares the handwritten and SDPA implementations.
-
-## Model Export
-
-Training checkpoints contain optimizer state and are therefore substantially larger than inference-only weights. The final 29.6M-model training checkpoint is approximately 356 MB, while the exported FP32 model is approximately **118.5 MB**.
-
-Export `checkpoints/final.pt` with:
-
-```bash
-PYTHONPATH=src uv run python scripts/export_model.py
-```
-
-The resulting `release/kestrel_30m.pt` contains the model state, architecture metadata, parameter count, training metadata, and evaluation metadata, but no optimizer state.
-
-## Accelerator Backends
-
-KestrelLM uses standard PyTorch device interfaces: `NVIDIA → CUDA`, `AMD → ROCm through torch.cuda`, `Apple → MPS`, and otherwise `CPU`.
-
-The repository keeps the default PyTorch dependency portable instead of forcing a ROCm-specific build. The primary GPU measurements in this README were collected on an **AMD Radeon RX 7900 XTX with HIP 7.2**. On machines where ROCm PyTorch is installed manually inside the `uv` environment, `uv run --no-sync ...` prevents dependency synchronization from replacing that build.
-
-## Project Structure
-
-The core model and training implementation is intentionally kept small: `src/` contains `config.py`, `dataloader.py`, `dataset.py`, `generate.py`, `model.py`, and `train.py`. Dataset preparation, evaluation, and export utilities live in `scripts/`; performance experiments live in `benchmarks/`; correctness checks live in `tests/`; the tokenizer is stored in `tokenizer/`; and README figures live in `assets/`.
-
-Generated or large artifacts remain local under `data/`, `checkpoints/`, `results/`, and `release/`.
-
-## Implementation Scope
-
-KestrelLM does not use a prebuilt Transformer model. Token and positional embeddings, RMSNorm, Q/K/V projections, multi-head causal attention, causal masking, attention-head splitting and recombination, SwiGLU, residual blocks, the decoder stack, tied input/output embeddings, loss computation, optimizer grouping, LR scheduling, checkpointing, generation, KV caching, configurable model scaling, and the experimental attention backends are implemented within the project.
-
-PyTorch provides tensor operations, automatic differentiation, accelerator backends, and AdamW.
-
-The aim is not to compete with production-scale language models. KestrelLM is a compact system for implementing and measuring the complete LM stack at a scale where architecture, training, inference, and systems behavior can all be studied directly.
+The Transformer implementation, S/M/L parameterization, training loop, checkpoint/resume path, generation code, dynamic KV caching, optional SDPA backend, scaling benchmark, new general-domain tokenizer, and finalized pretraining mixture are in place. The current work is transitioning the repository fully away from the old TinyStories preprocessing path, generating the new packed 1.2B-token corpus, pretraining Kestrel-L, evaluating Kestrel-Base, then implementing full supervised instruction tuning and SafeTensors release.
