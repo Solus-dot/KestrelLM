@@ -1,5 +1,32 @@
 # KestrelLM Pipeline
 
+## Summary: what to run, in order
+
+The project is meant to be executed as a sequence of artifacts: first freeze the tokenizer, then build the token corpus with that tokenizer, then pretrain and evaluate Kestrel-Base, then post-train and evaluate Kestrel-Instruct, and finally export inference-only SafeTensors releases. On the ROCm homelab, use `uv run --no-sync` so `uv` does not replace the manually installed ROCm PyTorch build, and use `PYTHONPATH=src` because the standalone scripts import modules from `src/` directly.
+
+| Step | File / command | Why it runs here |
+| --- | --- | --- |
+| 1. Train tokenizer | `PYTHONPATH=src uv run --no-sync python scripts/train_tokenizer.py` | Learns the frozen 8,192-token ByteLevel BPE vocabulary from the 70/20/10 general-domain sample. This is run once unless the tokenizer is intentionally changed. |
+| 2. Verify tokenizer | `PYTHONPATH=src uv run --no-sync python tests/test_tokenizer.py` | Confirms exact encode/decode round-trip, vocabulary size, and all seven reserved token IDs before a large corpus is encoded with it. |
+| 3. Build pretraining corpus | `PYTHONPATH=src uv run --no-sync python scripts/preprocess_data.py` | Streams FineWeb-Edu-Dedup, Cosmopedia v2, and FineWiki through the frozen tokenizer and writes exact `train.bin` and `validation.bin` token budgets. Any tokenizer change requires regenerating these files. |
+| 4. Inspect corpus | inspect `data/tokenized/train.bin` and `data/tokenized/validation.bin` | Confirms exact token counts and decodes a few windows before spending GPU time on training. This is a data-integrity gate rather than a separate pipeline script. |
+| 5. Optional hardware benchmark | `PYTHONPATH=src uv run --no-sync python benchmarks/training.py` | Rechecks Kestrel-L throughput and VRAM only when hardware, PyTorch/ROCm, batch size, or architecture changes. It is not required before every training run. |
+| 6. Pretrain Kestrel-Base | `PYTHONPATH=src uv run --no-sync python src/train.py --model large --steps 73242 --run-name kestrel_base_1p2b` | Trains Kestrel-L from scratch for exactly 73,242 optimizer steps = 1,199,996,928 tokens and produces resumable `.pt` checkpoints plus `final.pt`. |
+| 7. Evaluate Kestrel-Base | `PYTHONPATH=src uv run --no-sync python scripts/evaluate.py --checkpoint checkpoints/kestrel_base_1p2b/final.pt` | Measures held-out validation loss/perplexity before instruction tuning so base-model quality is separated from post-training effects. |
+| 8. Supervised instruction tuning | SFT preprocessing/training files are the next implementation stage | Serializes conversations with the reserved role tokens and trains from Kestrel-Base using assistant-only loss to produce Kestrel-Instruct. |
+| 9. Evaluate Kestrel-Instruct | instruction evaluation path to be finalized with the SFT stage | Measures instruction-following behavior separately from base language-model evaluation. |
+| 10. Export releases | `PYTHONPATH=src uv run --no-sync python scripts/export_model.py --checkpoint <checkpoint> --stage base` or `--stage instruct` | Converts trusted `.pt` training state into inference-only `model.safetensors`, `config.json`, and `tokenizer.json`, then reload-validates the exported model. |
+
+The dependency chain is therefore:
+
+```text
+train_tokenizer.py → test_tokenizer.py → preprocess_data.py → inspect token binaries → train.py → evaluate.py → SFT → instruct evaluation → export_model.py
+```
+
+The tokenizer and tokenized corpus are upstream dependencies: changing either invalidates every downstream model trained from them. Base evaluation happens before SFT so the effect of post-training remains measurable, and SafeTensors export happens last because public inference artifacts intentionally omit optimizer/resume state.
+
+---
+
 ## 1. Objective
 
 KestrelLM is a small decoder-only Transformer implemented from scratch in PyTorch. The project is no longer centered on a narrow story-generation corpus; the target is now a complete small-language-model lifecycle in which a general-domain base model is pretrained from raw text, evaluated as a language model, post-trained into an instruction-following model, and finally released in a standard inference format. The intended public artifacts are **Kestrel-Base**, representing the pretrained model before chat alignment, and **Kestrel-Instruct**, representing the same architecture after supervised instruction tuning.
@@ -61,7 +88,7 @@ Every pretraining document receives `<eos>` after encoding. The packed stream th
 document A <eos> document B <eos> document C <eos> document D <eos> ...
 ```
 
-The tokenizer-training process successfully reported an 8,192-token vocabulary and saved `tokenizer/tokenizer.json`. The Python process later emitted a `PyGILState_Release` fatal error during interpreter finalization, after the successful save message; this appears to be a shutdown problem in the native/streaming stack rather than a tokenizer-training failure. The saved tokenizer should nevertheless be explicitly loaded and checked before the 1.2B-token corpus is generated.
+The tokenizer-training process successfully reported an 8,192-token vocabulary and saved `tokenizer/tokenizer.json`. The Python process later emitted a `PyGILState_Release` fatal error during interpreter finalization, after the successful save message; this appears to be a shutdown problem in the native/streaming stack rather than a tokenizer-training failure. The saved tokenizer was subsequently loaded successfully: exact encode/decode round-trip passed, vocabulary size was 8,192, and all seven reserved tokens were present with unique IDs 0–6.
 
 ---
 
@@ -258,6 +285,6 @@ The 8,192-token general-domain tokenizer is frozen before corpus generation. The
 
 ## 13. Current implementation state
 
-The architecture, S/M/L parameterization, dynamic KV caching, optional SDPA backend, training loop, generation path, and width-scaling benchmark are already implemented. The new general-domain tokenizer has been trained and saved. The remaining base-model work is to finalize the general-domain preprocessing script in the repository, regenerate the binary train/validation files with the new tokenizer, pretrain Kestrel-L for exactly 1,199,996,928 tokens, and evaluate it. The post-training work then adds conversation formatting, assistant-only labels, full SFT, instruction evaluation, and finally SafeTensors publication.
+The architecture, S/M/L parameterization, dynamic KV caching, optional SDPA backend, training loop, generation path, width-scaling benchmark, general-domain tokenizer, general-domain preprocessing pipeline, and SafeTensors exporter are implemented. The tokenizer has been load-tested successfully with exact round-trip decoding, an 8,192-token vocabulary, and all seven reserved tokens present. The current base-model stage is generation of the new 1,199,996,928-token training binary and 10,000,000-token validation binary; after those files are integrity-checked, Kestrel-L can be pretrained for exactly 73,242 optimizer steps and evaluated. The post-training work then adds conversation formatting, assistant-only labels, full SFT, instruction evaluation, and final SafeTensors publication.
 
 The old domain-specific binary token files, if they still exist locally under the ignored `data/` directory, are invalid for the new tokenizer and must not be reused. `train.bin` and `validation.bin` must always be regenerated after a tokenizer change.
